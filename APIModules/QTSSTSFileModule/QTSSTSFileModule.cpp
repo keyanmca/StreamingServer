@@ -52,6 +52,93 @@
 
 #include "QTSS.h"
 
+class Ts2Rtp
+{
+public:
+	Ts2Rtp(){}
+	~Ts2Rtp(){}
+	void CreateRtp(unsigned char *inData, SInt32 inLength, SInt32 inPayloadType, SInt64 inTimeStamp, UInt32 inSSRC, SInt32 *ioSeqNum, Bool16 inMarker);
+	SInt32				m_nRtpLength;
+	unsigned char 		m_pBuffer[1500];
+	QTSS_PacketStruct	m_oPacket;
+};
+
+
+static const UInt32 TSPacketBytesMin = 188;
+static const UInt32 TSPacketPerRTP   = 7;
+class TSFileSession
+{
+public:
+	TSFileSession(const char *szFilename):lFirstPcr(0), lSecondPcr(0), nFirstPcrSeq(0), nSecondPcrSeq(0), fBitRate(0.0),
+	fWaitTime(0.0), lCurrentPcrTime(0), lCurrentPcrPid(0), lSizeOfBuffer(0), nCurrentPos(0), nCurrentRtpPacketSeq(1988), nCurrentTsPacketSeq(0),
+	cookie1(NULL), cookie2(NULL), pSSRC(NULL)
+	{
+		pFile = NULL;
+		pFile = fopen(szFilename, "rb");
+		if(pFile)
+		{
+			Assert(GetTwoPcr());
+			strcpy(szFileFullPath, szFilename);
+		}
+	}
+	~TSFileSession()
+	{
+		if(pFile)
+		{
+			fclose(pFile);
+		}
+	}
+
+	QTSS_PacketStruct& operator &()
+	{
+		return oRtpPacket.m_oPacket;
+	}
+
+	UInt32	GetBitrateOf7Packets();
+	UInt32	Read7PacketsAndMakeRtp(SInt64 inTimeStamp);
+	void	UpdatePcr(UInt64 lNewPcr, UInt32 nSeq);
+	void	SetSSRC(UInt32 *inSSRC){pSSRC = inSSRC;}
+	void 	SetCookies(void *inCookie1, UInt32 inCookie2){cookie1 = inCookie1; cookie2 = inCookie2;}
+
+	SInt64	lFirstPcr;
+	SInt64	lSecondPcr;
+	SInt32	nFirstPcrSeq;
+	SInt32	nSecondPcrSeq;
+
+	Float64	fBitRate;
+	Float32	fWaitTime;
+
+	SInt64	lCurrentPcrTime;
+	SInt64	lCurrentPcrPid;
+
+
+	unsigned char	pBufferFor7Packets[188 * 7];
+	SInt32			lSizeOfBuffer;
+
+	FILE	*pFile;
+	char	szFileFullPath[256];
+	SDPSourceInfo       fSDPSource;
+	//While reading file, we should record file position
+	SInt32	nCurrentPos;
+
+	SInt32	nCurrentRtpPacketSeq;
+	SInt32	nCurrentTsPacketSeq;
+
+	void 	*cookie1;
+	UInt32 	cookie2;
+	UInt32	*pSSRC;
+
+	//Rtp object
+	Ts2Rtp	oRtpPacket;
+private:
+	//Work only at start time so as to find out the first two pcr
+	//If false, ts file is invalid
+	Bool16 	GetTwoPcr();
+
+};
+
+
+
 class FileSession
 {
     public:
@@ -64,8 +151,11 @@ class FileSession
           fPacketStruct.packetData = NULL; fPacketStruct.packetTransmitTime = -1; fPacketStruct.suggestedWakeupTime=-1;
         }
         
-        ~FileSession() {}
-        
+        ~FileSession()
+        {
+
+        }
+
         QTRTPFile           fFile;
         SInt64              fAdjustedPlayTime;
         QTSS_PacketStruct   fPacketStruct;
@@ -88,6 +178,10 @@ class FileSession
 };
 
 // ref to the prefs dictionary object
+
+static FileSession *theFileSession;
+static TSFileSession *theTSFileSession;
+
 static QTSS_ModulePrefsObject       sPrefs;
 static QTSS_PrefsObject             sServerPrefs;
 static QTSS_Object                  sServer;
@@ -174,7 +268,7 @@ static QTSS_Error Initialize(QTSS_Initialize_Params* inParamBlock);
 static QTSS_Error RereadPrefs();
 static QTSS_Error ProcessRTSPRequest(QTSS_StandardRTSP_Params* inParamBlock);
 static QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock);
-static QTSS_Error CreateQTRTPFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath, FileSession** outFile);
+static QTSS_Error CreateQTTSFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath, TSFileSession** outFile);
 static QTSS_Error DoSetup(QTSS_StandardRTSP_Params* inParamBlock);
 static QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock);
 static QTSS_Error SendPackets(QTSS_RTPSendPackets_Params* inParams);
@@ -182,6 +276,14 @@ static QTSS_Error DestroySession(QTSS_ClientSessionClosing_Params* inParams);
 static void       DeleteFileSession(FileSession* inFileSession);
 static UInt32   WriteSDPHeader(FILE* sdpFile, iovec *theSDPVec, SInt16 *ioVectorIndex, StrPtrLen *sdpHeader);
 static void     BuildPrefBasedHeaders();
+
+//New addition by pengguokan
+//3/26/2014
+static Bool16 GetPCR(unsigned char *p_ts_packet, SInt64 *p_pcr, SInt32 *p_pcr_pid);
+static QTSS_Object globalStream = NULL;
+static UInt32 globalTrackSSRC = 0;
+
+
 
 QTSS_Error QTSSTSFileModule_Main(void* inPrivateArgs)
 {
@@ -606,21 +708,9 @@ Bool16 isSDP(QTSS_StandardRTSP_Params* inParamBlock);
 
 QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
 {
-    if (isSDP(inParamBlock))
-    {
-    	printf("It is SDP\n");
-        StrPtrLen pathStr;
-        (void)QTSS_LockObject(inParamBlock->inRTSPRequest);
-        (void)QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, (void**)&pathStr.Ptr, &pathStr.Len);
-        QTSS_Error err = QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest, qtssClientNotFound, sNoSDPFileFoundErr, &pathStr);
-        (void)QTSS_UnlockObject(inParamBlock->inRTSPRequest);
-        return err;
-    }
-    printf("It is not SDP\n");
-    //
     // Get the FileSession for this DESCRIBE, if any.
     UInt32 theLen = sizeof(FileSession*);
-    FileSession*    theFile = NULL;
+    TSFileSession*    theFile = NULL;
     QTSS_Error      theErr = QTSS_NoErr;
     Bool16          pathEndsWithSDP = false;
     static StrPtrLen sSDPSuffix(".sdp");
@@ -650,18 +740,18 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
         //
         // There is already a file for this session. This can happen if there are multiple DESCRIBES,
         // or a DESCRIBE has been issued with a Session ID, or some such thing.
-        StrPtrLen   moviePath( theFile->fFile.GetMoviePath() );
+        StrPtrLen   moviePath( theFile->szFileFullPath);
                 
 		// Stop playing because the new file isn't ready yet to send packets.
 		// Needs a Play request to get things going. SendPackets on the file is active if not paused.
 		(void)QTSS_Pause(inParamBlock->inClientSession);
-		(*theFile).fPaused = true;
+		//(*theFile).fPaused = true;
 
         //
         // This describe is for a different file. Delete the old FileSession.
         if ( !requestPath.Equal( moviePath ) )
         {
-            DeleteFileSession(theFile);
+            //DeleteFileSession(theFile);
             theFile = NULL;
             
             // NULL out the attribute value, just in case.
@@ -671,11 +761,12 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
 
     if ( theFile == NULL )
     {   
-        theErr = CreateQTRTPFile(inParamBlock, thePath.GetObject(), &theFile);
+        theErr = CreateQTTSFile(inParamBlock, thePath.GetObject(), &theFile);
         if (theErr != QTSS_NoErr)
             return theErr;
     
         // Store this newly created file object in the RTP session.
+        //FIXME Can I put TSFileSession object into it?
         theErr = QTSS_SetValue(inParamBlock->inClientSession, sFileSessionAttr, 0, &theFile, sizeof(theFile));
     }
     
@@ -685,70 +776,71 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
     iovec theSDPVec[sNumSDPVectors];//1 for the RTSP header, 6 for the sdp header, 1 for the sdp body
     ::memset(&theSDPVec[0], 0, sizeof(theSDPVec));
     
-    if (sEnableMovieFileSDP)
-    {
-        // Check to see if there is an sdp file, if so, return that file instead
-        // of the built-in sdp. ReadEntireFile allocates memory but if all goes well theSDPData will be managed by the File Session
-        (void)QTSSModuleUtils::ReadEntireFile(thePath.GetObject(), &theSDPData);
-    }
+//    if (sEnableMovieFileSDP)
+//    {
+//        // Check to see if there is an sdp file, if so, return that file instead
+//        // of the built-in sdp. ReadEntireFile allocates memory but if all goes well theSDPData will be managed by the File Session
+//        (void)QTSSModuleUtils::ReadEntireFile(thePath.GetObject(), &theSDPData);
+//    }
+
     OSCharArrayDeleter sdpDataDeleter(theSDPData.Ptr); // Just in case we fail we know to clean up. But we clear the deleter if we succeed.
 
-    if (theSDPData.Len > 0)
-    {   
-        SDPContainer fileSDPContainer; 
-        fileSDPContainer.SetSDPBuffer(&theSDPData);  
-        if (!fileSDPContainer.IsSDPBufferValid())
-        {    return QTSSModuleUtils::SendErrorResponseWithMessage(inParamBlock->inRTSPRequest, qtssUnsupportedMediaType, &sSDPNotValidMessage);
-        }
-    
-        
-        // Append the Last Modified header to be a good caching proxy citizen before sending the Describe
-        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssLastModifiedHeader,
-                                        theFile->fFile.GetQTFile()->GetModDateStr(), DateBuffer::kDateBufferLen);
-        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssCacheControlHeader,
-                                        kCacheControlHeader.Ptr, kCacheControlHeader.Len);
-
-        //Now that we have the file data, send an appropriate describe
-        //response to the client
-        theSDPVec[1].iov_base = theSDPData.Ptr;
-        theSDPVec[1].iov_len = theSDPData.Len;
-
-        QTSSModuleUtils::SendDescribeResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession,
-                                                                &theSDPVec[0], 3, theSDPData.Len);  
-    }
-    else
+//    if (theSDPData.Len > 0)
+//    {
+//        SDPContainer fileSDPContainer;
+//        fileSDPContainer.SetSDPBuffer(&theSDPData);
+//        if (!fileSDPContainer.IsSDPBufferValid())
+//        {    return QTSSModuleUtils::SendErrorResponseWithMessage(inParamBlock->inRTSPRequest, qtssUnsupportedMediaType, &sSDPNotValidMessage);
+//        }
+//
+//
+//        // Append the Last Modified header to be a good caching proxy citizen before sending the Describe
+//        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssLastModifiedHeader,
+//                                        theFile->fFile.GetQTFile()->GetModDateStr(), DateBuffer::kDateBufferLen);
+//        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssCacheControlHeader,
+//                                        kCacheControlHeader.Ptr, kCacheControlHeader.Len);
+//
+//        //Now that we have the file data, send an appropriate describe
+//        //response to the client
+//        theSDPVec[1].iov_base = theSDPData.Ptr;
+//        theSDPVec[1].iov_len = theSDPData.Len;
+//
+//        QTSSModuleUtils::SendDescribeResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession,
+//                                                                &theSDPVec[0], 3, theSDPData.Len);
+//    }
+//    else
     {
         // Before generating the SDP and sending it, check to see if there is an If-Modified-Since
         // date. If there is, and the content hasn't been modified, then just return a 304 Not Modified
-        QTSS_TimeVal* theTime = NULL;
-        (void) QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqIfModSinceDate, 0, (void**)&theTime, &theLen);
-        if ((theLen == sizeof(QTSS_TimeVal)) && (*theTime > 0))
-        {
-            // There is an If-Modified-Since header. Check it vs. the content.
-            if (*theTime == theFile->fFile.GetQTFile()->GetModDate())
-            {
-                theErr = QTSS_SetValue( inParamBlock->inRTSPRequest, qtssRTSPReqStatusCode, 0,
-                                        &kNotModifiedStatus, sizeof(kNotModifiedStatus) );
-                Assert(theErr == QTSS_NoErr);
-                // Because we are using this call to generate a 304 Not Modified response, we do not need
-                // to pass in a RTP Stream
-                theErr = QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession, 0);
-                Assert(theErr == QTSS_NoErr);
-                return QTSS_NoErr;
-            }
-        }
+//        QTSS_TimeVal* theTime = NULL;
+//        (void) QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqIfModSinceDate, 0, (void**)&theTime, &theLen);
+//        if ((theLen == sizeof(QTSS_TimeVal)) && (*theTime > 0))
+//        {
+//            // There is an If-Modified-Since header. Check it vs. the content.
+//            if (*theTime == theFile->fFile.GetQTFile()->GetModDate())
+//            {
+//                theErr = QTSS_SetValue( inParamBlock->inRTSPRequest, qtssRTSPReqStatusCode, 0,
+//                                        &kNotModifiedStatus, sizeof(kNotModifiedStatus) );
+//                Assert(theErr == QTSS_NoErr);
+//                // Because we are using this call to generate a 304 Not Modified response, we do not need
+//                // to pass in a RTP Stream
+//                theErr = QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession, 0);
+//                Assert(theErr == QTSS_NoErr);
+//                return QTSS_NoErr;
+//            }
+//        }
         
         FILE* sdpFile = NULL;
-        if (sRecordMovieFileSDP &&  !pathEndsWithSDP) // don't auto create sdp for an sdp file because it would look like a broadcast
-        {   
-            sdpFile = ::fopen(thePath.GetObject(),"r"); // see if there already is a .sdp for the movie
-            if (sdpFile != NULL) // one already exists don't mess with it
-            {   ::fclose(sdpFile);
-                sdpFile = NULL;
-            }
-            else
-                sdpFile = ::fopen(thePath.GetObject(),"w"); // create the .sdp
-        }
+//        if (sRecordMovieFileSDP &&  !pathEndsWithSDP) // don't auto create sdp for an sdp file because it would look like a broadcast
+//        {
+//            sdpFile = ::fopen(thePath.GetObject(),"r"); // see if there already is a .sdp for the movie
+//            if (sdpFile != NULL) // one already exists don't mess with it
+//            {   ::fclose(sdpFile);
+//                sdpFile = NULL;
+//            }
+//            else
+//                sdpFile = ::fopen(thePath.GetObject(),"w"); // create the .sdp
+//        }
         
         UInt32 totalSDPLength = 0;
         
@@ -783,7 +875,7 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
         
         // the first number is the NTP time used for the session identifier (this changes for each request)
         // the second number is the NTP date time of when the file was modified (this changes when the file changes)
-        qtss_sprintf(ownerLine, "o=StreamingServer %"_64BITARG_"d %"_64BITARG_"d IN IP4 %s", (SInt64) OS::UnixTime_Secs() + 2208988800LU, (SInt64) theFile->fFile.GetQTFile()->GetModDate(),ipCstr);
+        qtss_sprintf(ownerLine, "o=StreamingServer %"_64BITARG_"d %"_64BITARG_"d IN IP4 %s", (SInt64) OS::UnixTime_Secs() + 2208988800LU, (SInt64)1395298249000 /*theFile->fFile.GetQTFile()->GetModDate()*/,ipCstr);
         Assert(ownerLine[sLineSize - 1] == 0);
 
         StrPtrLen ownerStr(ownerLine);
@@ -798,25 +890,25 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
     
 // -------- uri header
 
-        theFullSDPBuffer.Put(sURLHeader);
-        theFullSDPBuffer.Put(sEOL);
+       // theFullSDPBuffer.Put(sURLHeader);
+       // theFullSDPBuffer.Put(sEOL);
 
     
 // -------- email header
 
-        theFullSDPBuffer.Put(sEmailHeader);
-        theFullSDPBuffer.Put(sEOL);
+        //theFullSDPBuffer.Put(sEmailHeader);
+        //theFullSDPBuffer.Put(sEOL);
 
 // -------- connection information header
         
-        theFullSDPBuffer.Put(sConnectionHeader); 
-        theFullSDPBuffer.Put(sEOL);
+       // theFullSDPBuffer.Put(sConnectionHeader);
+       // theFullSDPBuffer.Put(sEOL);
 
 // -------- time header
 
         // t=0 0 is a permanent always available movie (doesn't ever change unless we change the code)
-        theFullSDPBuffer.Put(sPermanentTimeHeader);
-        theFullSDPBuffer.Put(sEOL);
+       // theFullSDPBuffer.Put(sPermanentTimeHeader);
+       // theFullSDPBuffer.Put(sEOL);
         
 // -------- control header
 
@@ -826,41 +918,47 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
                 
 // -------- add buffer delay
 
-        if (sAddClientBufferDelaySecs > 0) // increase the client buffer delay by the preference amount.
-        {
-            Float32 bufferDelay = 3.0; // the client doesn't advertise it's default value so we guess.
-            
-            static StrPtrLen sBuffDelayStr("a=x-bufferdelay:");
-        
-            StrPtrLen delayStr;
-            theSDPData.FindString(sBuffDelayStr, &delayStr);
-            if (delayStr.Len > 0)
-            {
-                UInt32 offset = (delayStr.Ptr - theSDPData.Ptr) + delayStr.Len; // step past the string
-                delayStr.Ptr = theSDPData.Ptr + offset;
-                delayStr.Len = theSDPData.Len - offset;
-                StringParser theBufferSecsParser(&delayStr);
-                theBufferSecsParser.ConsumeWhitespace();
-                bufferDelay = theBufferSecsParser.ConsumeFloat();
-            }
-            
-            bufferDelay += sAddClientBufferDelaySecs;
-
-           
-            qtss_sprintf(tempBufferDelay, "a=x-bufferdelay:%.2f",bufferDelay);
-            bufferDelayStr.Set(tempBufferDelay); 
-                
-            theFullSDPBuffer.Put(bufferDelayStr); 
-            theFullSDPBuffer.Put(sEOL);
-        }
+//        if (sAddClientBufferDelaySecs > 0) // increase the client buffer delay by the preference amount.
+//        {
+//            Float32 bufferDelay = 3.0; // the client doesn't advertise it's default value so we guess.
+//
+//            static StrPtrLen sBuffDelayStr("a=x-bufferdelay:");
+//
+//            StrPtrLen delayStr;
+//            theSDPData.FindString(sBuffDelayStr, &delayStr);
+//            if (delayStr.Len > 0)
+//            {
+//                UInt32 offset = (delayStr.Ptr - theSDPData.Ptr) + delayStr.Len; // step past the string
+//                delayStr.Ptr = theSDPData.Ptr + offset;
+//                delayStr.Len = theSDPData.Len - offset;
+//                StringParser theBufferSecsParser(&delayStr);
+//                theBufferSecsParser.ConsumeWhitespace();
+//                bufferDelay = theBufferSecsParser.ConsumeFloat();
+//            }
+//
+//            bufferDelay += sAddClientBufferDelaySecs;
+//
+//
+//            qtss_sprintf(tempBufferDelay, "a=x-bufferdelay:%.2f",bufferDelay);
+//            bufferDelayStr.Set(tempBufferDelay);
+//
+//            theFullSDPBuffer.Put(bufferDelayStr);
+//            theFullSDPBuffer.Put(sEOL);
+//        }
         
  // -------- movie file sdp data
 
         //now append content-determined sdp ( cached in QTRTPFile )
-        int sdpLen = 0;
-        theSDPData.Ptr = theFile->fFile.GetSDPFile(&sdpLen);
-        theSDPData.Len = sdpLen;
-
+//        if(0){
+//        int sdpLen = 0;
+//			theSDPData.Ptr = theFile->fFile.GetSDPFile(&sdpLen);
+//			theSDPData.Len = sdpLen;
+//        }
+        //My own way to define sdp
+        //theSDPData.Ptr = "t=0 0\r\na=isma-compliance:1,1.0,1\r\na=range:npt=0-  77.00000\r\nm=video 0 RTP/AVP 33\r\n";
+        //theSDPData.Ptr = "t=0 0\r\nm=audio 20154 RTP/AVP 0\r\na=control:trackID=1\r\nm=video 0 RTP/AVP 33\r\na=control:trackID=2\r\n";
+        theSDPData.Ptr = "m=video 0 RTP/AVP 33\r\na=rtpmap:33 MP2T/90000\r\na=control:trackID=0\r\n";
+        theSDPData.Len = strlen(theSDPData.Ptr);
 // ----------- Add the movie's sdp headers to our sdp headers
  
 		theFullSDPBuffer.Put(theSDPData); 
@@ -921,8 +1019,8 @@ A server implementing rate adaptation shall signal the "3GPP-Adaptation-Support"
         //ok, we have a filled out iovec. Let's send the response!
         
         // Append the Last Modified header to be a good caching proxy citizen before sending the Describe
-        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssLastModifiedHeader,
-                                        theFile->fFile.GetQTFile()->GetModDateStr(), DateBuffer::kDateBufferLen);
+        //(void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssLastModifiedHeader,
+        //                               theFile->fFile.GetQTFile()->GetModDateStr(), DateBuffer::kDateBufferLen);
         (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssCacheControlHeader,
                                         kCacheControlHeader.Ptr, kCacheControlHeader.Len);
         QTSSModuleUtils::SendDescribeResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession,
@@ -940,43 +1038,48 @@ A server implementing rate adaptation shall signal the "3GPP-Adaptation-Support"
     return QTSS_NoErr;
 }
 
-QTSS_Error CreateQTRTPFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath, FileSession** outFile)
+QTSS_Error CreateQTTSFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath, TSFileSession** outFile)
 {   
-    *outFile = NEW FileSession();
-    (*outFile)->fFile.SetAllowInvalidHintRefs(sAllowInvalidHintRefs);
+    *outFile = NEW TSFileSession(inPath);
+    //FIXME Handle the sitituation of failing to open file
+    //(*outFile)->fFile.SetAllowInvalidHintRefs(sAllowInvalidHintRefs);
+    //Open a ts file
+    //theTSFileSession = NEW TSFileSession();
+
     //Set a fake file, coz I dont know how to open a hinted file and fetch its track info either.
     //QTRTPFile::ErrorCode theErr = (*outFile)->fFile.Initialize(inPath);
-    QTRTPFile::ErrorCode theErr = (*outFile)->fFile.Initialize("/usr/local/movies/sample_100kbit.mp4");
-    if (theErr != QTRTPFile::errNoError)
-    {
-        delete *outFile;
-        *outFile = NULL;
-
-        char* thePathStr = NULL;
-        (void)QTSS_GetValueAsString(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, &thePathStr);
-        QTSSCharArrayDeleter thePathStrDeleter(thePathStr);
-        StrPtrLen thePath(thePathStr);        
-		
-        if (theErr == QTRTPFile::errFileNotFound)
-            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
-                                                        qtssClientNotFound,
-                                                        sNoSDPFileFoundErr,&thePath);
-        if (theErr == QTRTPFile::errInvalidQuickTimeFile)
-            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
-                                                        qtssUnsupportedMediaType,
-                                                        sBadQTFileErr,&thePath);
-        if (theErr == QTRTPFile::errNoHintTracks)
-            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
-                                                        qtssUnsupportedMediaType,
-                                                        sFileIsNotHintedErr,&thePath);
-        if (theErr == QTRTPFile::errInternalError)
-            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
-                                                        qtssServerInternal,
-                                                        sBadQTFileErr,&thePath);
-
-        AssertV(0, theErr);
-    }
+    //QTRTPFile::ErrorCode theErr = (*outFile)->fFile.Initialize("/usr/local/movies/sample_100kbit.mp4");
+//    if (theErr != QTRTPFile::errNoError)
+//    {
+//        delete *outFile;
+//        *outFile = NULL;
+//
+//        char* thePathStr = NULL;
+//        (void)QTSS_GetValueAsString(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, &thePathStr);
+//        QTSSCharArrayDeleter thePathStrDeleter(thePathStr);
+//        StrPtrLen thePath(thePathStr);
+//
+//        if (theErr == QTRTPFile::errFileNotFound)
+//            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
+//                                                        qtssClientNotFound,
+//                                                        sNoSDPFileFoundErr,&thePath);
+//        if (theErr == QTRTPFile::errInvalidQuickTimeFile)
+//            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
+//                                                        qtssUnsupportedMediaType,
+//                                                        sBadQTFileErr,&thePath);
+//        if (theErr == QTRTPFile::errNoHintTracks)
+//            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
+//                                                        qtssUnsupportedMediaType,
+//                                                        sFileIsNotHintedErr,&thePath);
+//        if (theErr == QTRTPFile::errInternalError)
+//            return QTSSModuleUtils::SendErrorResponse(  inParamBlock->inRTSPRequest,
+//                                                        qtssServerInternal,
+//                                                        sBadQTFileErr,&thePath);
+//
+//        AssertV(0, theErr);
+//    }
 	
+
     return QTSS_NoErr;
 }
 
@@ -984,174 +1087,184 @@ QTSS_Error CreateQTRTPFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath,
 QTSS_Error DoSetup(QTSS_StandardRTSP_Params* inParamBlock)
 {
 
-    if (isSDP(inParamBlock))
-    {
-        StrPtrLen pathStr;
-        (void)QTSS_LockObject(inParamBlock->inRTSPRequest);
-        (void)QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, (void**)&pathStr.Ptr, &pathStr.Len);
-        QTSS_Error err = QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest, qtssClientNotFound, sNoSDPFileFoundErr, &pathStr);
-        (void)QTSS_UnlockObject(inParamBlock->inRTSPRequest);
-        return err;
-    }
-    
-    //setup this track in the file object 
-    FileSession* theFile = NULL;
-    UInt32 theLen = sizeof(FileSession*);
-    QTSS_Error theErr = QTSS_GetValue(inParamBlock->inClientSession, sFileSessionAttr, 0, (void*)&theFile, &theLen);
-    if ((theErr != QTSS_NoErr) || (theLen != sizeof(FileSession*)))
-    {
-        char* theFullPath = NULL;
-        //theErr = QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqLocalPath, 0, (void**)&theFullPath, &theLen);
-		theErr = QTSS_GetValueAsString(inParamBlock->inRTSPRequest, qtssRTSPReqLocalPath, 0, &theFullPath);
-        Assert(theErr == QTSS_NoErr);
-        // This is possible, as clients are not required to send a DESCRIBE. If we haven't set
-        // anything up yet, set everything up
-        theErr = CreateQTRTPFile(inParamBlock, theFullPath, &theFile);
-		QTSS_Delete(theFullPath);
-        if (theErr != QTSS_NoErr)
-            return theErr;
+//	if (isSDP(inParamBlock))
+//	    {
+//	        StrPtrLen pathStr;
+//	        (void)QTSS_LockObject(inParamBlock->inRTSPRequest);
+//	        (void)QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, (void**)&pathStr.Ptr, &pathStr.Len);
+//	        QTSS_Error err = QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest, qtssClientNotFound, sNoSDPFileFoundErr, &pathStr);
+//	        (void)QTSS_UnlockObject(inParamBlock->inRTSPRequest);
+//	        return err;
+//	    }
 
-        int theSDPBodyLen = 0;
-        char* theSDPData = theFile->fFile.GetSDPFile(&theSDPBodyLen);
+	    //setup this track in the file object
+	    TSFileSession* theFile = NULL;
+	    UInt32 theLen = sizeof(FileSession*);
+	    QTSS_Error theErr = QTSS_GetValue(inParamBlock->inClientSession, sFileSessionAttr, 0, (void*)&theFile, &theLen);
+//	    if ((theErr != QTSS_NoErr) || (theLen != sizeof(FileSession*)))
+//	    {
+//	        char* theFullPath = NULL;
+//	        //theErr = QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqLocalPath, 0, (void**)&theFullPath, &theLen);
+//			theErr = QTSS_GetValueAsString(inParamBlock->inRTSPRequest, qtssRTSPReqLocalPath, 0, &theFullPath);
+//	        Assert(theErr == QTSS_NoErr);
+//	        // This is possible, as clients are not required to send a DESCRIBE. If we haven't set
+//	        // anything up yet, set everything up
+//	        theErr = CreateQTRTPFile(inParamBlock, theFullPath, &theFile);
+//			QTSS_Delete(theFullPath);
+//	        if (theErr != QTSS_NoErr)
+//	            return theErr;
+//
+//	        int theSDPBodyLen = 0;
+//	        char* theSDPData = theFile->fFile.GetSDPFile(&theSDPBodyLen);
+//
+//	        //now parse the sdp. We need to do this in order to extract payload information.
+//	        //The SDP parser object will not take responsibility of the memory (one exception... see above)
+//	        theFile->fSDPSource.Parse(theSDPData, theSDPBodyLen);
+//
+//	        // Store this newly created file object in the RTP session.
+//	        theErr = QTSS_SetValue(inParamBlock->inClientSession, sFileSessionAttr, 0, &theFile, sizeof(theFile));
+//	    }
 
-        //now parse the sdp. We need to do this in order to extract payload information.
-        //The SDP parser object will not take responsibility of the memory (one exception... see above)
-        theFile->fSDPSource.Parse(theSDPData, theSDPBodyLen);
+	    //unless there is a digit at the end of this path (representing trackID), don't
+	    //even bother with the request
+	    char* theDigitStr = NULL;
+	    (void)QTSS_GetValueAsString(inParamBlock->inRTSPRequest, qtssRTSPReqFileDigit, 0, &theDigitStr);
+//	    QTSSCharArrayDeleter theDigitStrDeleter(theDigitStr);
+//		if (theDigitStr == NULL)
+//	        return QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest,
+//	                                                    qtssClientBadRequest, sExpectedDigitFilenameErr);
 
-        // Store this newly created file object in the RTP session.
-        theErr = QTSS_SetValue(inParamBlock->inClientSession, sFileSessionAttr, 0, &theFile, sizeof(theFile));
-    }
+	    //FIXME ATTENTION: TrackID should appear in sdp file, may be like "a=control:trackID=0"
+	    UInt32 theTrackID = 0;//::strtol(theDigitStr, NULL, 10);
 
-    //unless there is a digit at the end of this path (representing trackID), don't
-    //even bother with the request
-    char* theDigitStr = NULL;
-    (void)QTSS_GetValueAsString(inParamBlock->inRTSPRequest, qtssRTSPReqFileDigit, 0, &theDigitStr);
-    QTSSCharArrayDeleter theDigitStrDeleter(theDigitStr);
-	if (theDigitStr == NULL)
-        return QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest,
-                                                    qtssClientBadRequest, sExpectedDigitFilenameErr);
-	
-    UInt32 theTrackID = ::strtol(theDigitStr, NULL, 10);
-    
-//    QTRTPFile::ErrorCode qtfileErr = theFile->fFile.AddTrack(theTrackID, false); //test for 3gpp monotonic wall clocktime and sequence
-    QTRTPFile::ErrorCode qtfileErr = theFile->fFile.AddTrack(theTrackID, true);
-    
-    //if we get an error back, forward that error to the client
-    if (qtfileErr == QTRTPFile::errTrackIDNotFound)
-        return QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest,
-                                                    qtssClientNotFound, sTrackDoesntExistErr);
-    else if (qtfileErr != QTRTPFile::errNoError)
-        return QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest,
-                                                    qtssUnsupportedMediaType, sBadQTFileErr);
+	//    QTRTPFile::ErrorCode qtfileErr = theFile->fFile.AddTrack(theTrackID, false); //test for 3gpp monotonic wall clocktime and sequence
+//	    QTRTPFile::ErrorCode qtfileErr = theFile->fFile.AddTrack(theTrackID, true);
+//
+//	    //if we get an error back, forward that error to the client
+//	    if (qtfileErr == QTRTPFile::errTrackIDNotFound)
+//	        return QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest,
+//	                                                    qtssClientNotFound, sTrackDoesntExistErr);
+//	    else if (qtfileErr != QTRTPFile::errNoError)
+//	        return QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest,
+//	                                                    qtssUnsupportedMediaType, sBadQTFileErr);
 
-    // Before setting up this track, check to see if there is an If-Modified-Since
-    // date. If there is, and the content hasn't been modified, then just return a 304 Not Modified
-    QTSS_TimeVal* theTime = NULL;
-    (void) QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqIfModSinceDate, 0, (void**)&theTime, &theLen);
-    if ((theLen == sizeof(QTSS_TimeVal)) && (*theTime > 0))
-    {
-        // There is an If-Modified-Since header. Check it vs. the content.
-        if (*theTime == theFile->fFile.GetQTFile()->GetModDate())
-        {
-            theErr = QTSS_SetValue( inParamBlock->inRTSPRequest, qtssRTSPReqStatusCode, 0,
-                                            &kNotModifiedStatus, sizeof(kNotModifiedStatus) );
-            Assert(theErr == QTSS_NoErr);
-            // Because we are using this call to generate a 304 Not Modified response, we do not need
-            // to pass in a RTP Stream
-            theErr = QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession, 0);
-            Assert(theErr == QTSS_NoErr);
-            return QTSS_NoErr;
-        }
-    }
+	    // Before setting up this track, check to see if there is an If-Modified-Since
+	    // date. If there is, and the content hasn't been modified, then just return a 304 Not Modified
+	    QTSS_TimeVal* theTime = NULL;
+	    (void) QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqIfModSinceDate, 0, (void**)&theTime, &theLen);
+//	    if ((theLen == sizeof(QTSS_TimeVal)) && (*theTime > 0))
+//	    {
+//	        // There is an If-Modified-Since header. Check it vs. the content.
+//	        if (*theTime == theFile->fFile.GetQTFile()->GetModDate())
+//	        {
+//	            theErr = QTSS_SetValue( inParamBlock->inRTSPRequest, qtssRTSPReqStatusCode, 0,
+//	                                            &kNotModifiedStatus, sizeof(kNotModifiedStatus) );
+//	            Assert(theErr == QTSS_NoErr);
+//	            // Because we are using this call to generate a 304 Not Modified response, we do not need
+//	            // to pass in a RTP Stream
+//	            theErr = QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession, 0);
+//	            Assert(theErr == QTSS_NoErr);
+//	            return QTSS_NoErr;
+//	        }
+//	    }
 
-    //find the payload for this track ID (if applicable)
-    StrPtrLen* thePayload = NULL;
-    UInt32 thePayloadType = qtssUnknownPayloadType;
-    Float32 bufferDelay = (Float32) 3.0; // FIXME need a constant defined for 3.0 value. It is used multiple places
+	    //find the payload for this track ID (if applicable)
+	    StrPtrLen* thePayload = NULL;
+	    UInt32 thePayloadType = qtssUnknownPayloadType;
+	    Float32 bufferDelay = (Float32) 3.0; // FIXME need a constant defined for 3.0 value. It is used multiple places
 
-    for (UInt32 x = 0; x < theFile->fSDPSource.GetNumStreams(); x++)
-    {
-        SourceInfo::StreamInfo* theStreamInfo = theFile->fSDPSource.GetStreamInfo(x);
-        if (theStreamInfo->fTrackID == theTrackID)
-        {
-            thePayload = &theStreamInfo->fPayloadName;
-            thePayloadType = theStreamInfo->fPayloadType;
-            bufferDelay = theStreamInfo->fBufferDelay;
-            break;
-        }   
-    }
-    //Create a new RTP stream           
-    QTSS_RTPStreamObject newStream = NULL;
-    theErr = QTSS_AddRTPStream(inParamBlock->inClientSession, inParamBlock->inRTSPRequest, &newStream, 0);
-    if (theErr != QTSS_NoErr)
-        return theErr;
-    
-    // Set the payload type, payload name & timescale of this track
-    SInt32 theTimescale = theFile->fFile.GetTrackTimeScale(theTrackID);
-    
+	    for (UInt32 x = 0; x < theFile->fSDPSource.GetNumStreams(); x++)
+	    {
+	        SourceInfo::StreamInfo* theStreamInfo = theFile->fSDPSource.GetStreamInfo(x);
+	        if (theStreamInfo->fTrackID == theTrackID)
+	        {
+	        	//MP2T or MPEGTS
+	            thePayload = &theStreamInfo->fPayloadName;
+	            //Payload type maybe 33 or 96
+	            thePayloadType = theStreamInfo->fPayloadType;
+	            //What is buffer delay?
+	            //bufferDelay = theStreamInfo->fBufferDelay;
+	            break;
+	        }
+	    }
+	    //See if qtssRTSPReqFileName is valid or not
+//	    StrPtrLen szFilename;
+//	    UInt32 nFileSize = 0;
+//	    theErr = QTSS_GetValue(inParamBlock->inRTSPRequest, qtssRTSPReqFileName, 0, &szFilename, &nFileSize);
 
-    theErr = QTSS_SetValue(newStream, qtssRTPStrBufferDelayInSecs, 0, &bufferDelay, sizeof(bufferDelay));
-    Assert(theErr == QTSS_NoErr);
-    theErr = QTSS_SetValue(newStream, qtssRTPStrPayloadName, 0, thePayload->Ptr, thePayload->Len);
-    Assert(theErr == QTSS_NoErr);
-    theErr = QTSS_SetValue(newStream, qtssRTPStrPayloadType, 0, &thePayloadType, sizeof(thePayloadType));
-    Assert(theErr == QTSS_NoErr);
-    theErr = QTSS_SetValue(newStream, qtssRTPStrTimescale, 0, &theTimescale, sizeof(theTimescale));
-    Assert(theErr == QTSS_NoErr);
-    theErr = QTSS_SetValue(newStream, qtssRTPStrTrackID, 0, &theTrackID, sizeof(theTrackID));
-    Assert(theErr == QTSS_NoErr);
-    
-    // Set the number of quality levels. Allow up to 6
-    static UInt32 sNumQualityLevels = 6;  
-    theErr = QTSS_SetValue(newStream, qtssRTPStrNumQualityLevels, 0, &sNumQualityLevels, sizeof(sNumQualityLevels));
-    Assert(theErr == QTSS_NoErr);
-    
-    // Get the SSRC of this track
-    UInt32* theTrackSSRC = NULL;
-    UInt32 theTrackSSRCSize = 0;
-    (void)QTSS_GetValuePtr(newStream, qtssRTPStrSSRC, 0, (void**)&theTrackSSRC, &theTrackSSRCSize);
+	    //Create a new RTP stream
+	    QTSS_RTPStreamObject newStream = NULL;
+	    theErr = QTSS_AddRTPStream(inParamBlock->inClientSession, inParamBlock->inRTSPRequest, &newStream, 0);
+	    if (theErr != QTSS_NoErr)
+	        return theErr;
 
-    // The RTP stream should ALWAYS have an SSRC assuming QTSS_AddStream succeeded.
-    Assert((theTrackSSRC != NULL) && (theTrackSSRCSize == sizeof(UInt32)));
-    
-    //give the file some info it needs.
-    theFile->fFile.SetTrackSSRC(theTrackID, *theTrackSSRC);
-    theFile->fFile.SetTrackCookies(theTrackID, newStream, thePayloadType);
-    
-    StrPtrLen theHeader;
-    theErr = QTSS_GetValuePtr(inParamBlock->inRTSPHeaders, qtssXRTPMetaInfoHeader, 0, (void**)&theHeader.Ptr, &theHeader.Len);
-    if (theErr == QTSS_NoErr)
-    {
-        //
-        // If there is an x-RTP-Meta-Info header in the request, mirror that header in the
-        // response. We will support any fields supported by the QTFileLib.
-        RTPMetaInfoPacket::FieldID* theFields = NEW RTPMetaInfoPacket::FieldID[RTPMetaInfoPacket::kNumFields];
-        ::memcpy(theFields, QTRTPFile::GetSupportedRTPMetaInfoFields(), sizeof(RTPMetaInfoPacket::FieldID) * RTPMetaInfoPacket::kNumFields);
+	    // Set the payload type, payload name & timescale of this track
+	    //Here 90000(90K) is assigned
+	    SInt32 theTimescale = 90000;//theFile->fFile.GetTrackTimeScale(theTrackID);
 
-        //
-        // This function does the work of appending the response header based on the
-        // fields we support and the requested fields.
-        theErr = QTSSModuleUtils::AppendRTPMetaInfoHeader(inParamBlock->inRTSPRequest, &theHeader, theFields);
 
-        //
-        // This returns QTSS_NoErr only if there are some valid, useful fields
-        Bool16 isVideo = false;
-        if (thePayloadType == qtssVideoPayloadType)
-            isVideo = true;
-        if (theErr == QTSS_NoErr)
-            theFile->fFile.SetTrackRTPMetaInfo(theTrackID, theFields, isVideo);
-    }
-    
-    //
-    // Our array has now been updated to reflect the fields requested by the client.
-    //send the setup response
-    (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssLastModifiedHeader,
-                                theFile->fFile.GetQTFile()->GetModDateStr(), DateBuffer::kDateBufferLen);
-    (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssCacheControlHeader,
-                                kCacheControlHeader.Ptr, kCacheControlHeader.Len);
-    theErr = QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, newStream, 0);
-    Assert(theErr == QTSS_NoErr);
-    return QTSS_NoErr;
+	    theErr = QTSS_SetValue(newStream, qtssRTPStrBufferDelayInSecs, 0, &bufferDelay, sizeof(bufferDelay));
+	    Assert(theErr == QTSS_NoErr);
+	    theErr = QTSS_SetValue(newStream, qtssRTPStrPayloadName, 0, thePayload->Ptr, thePayload->Len);
+	    Assert(theErr == QTSS_NoErr);
+	    theErr = QTSS_SetValue(newStream, qtssRTPStrPayloadType, 0, &thePayloadType, sizeof(thePayloadType));
+	    Assert(theErr == QTSS_NoErr);
+	    theErr = QTSS_SetValue(newStream, qtssRTPStrTimescale, 0, &theTimescale, sizeof(theTimescale));
+	    Assert(theErr == QTSS_NoErr);
+	    theErr = QTSS_SetValue(newStream, qtssRTPStrTrackID, 0, &theTrackID, sizeof(theTrackID));
+	    Assert(theErr == QTSS_NoErr);
+
+	    // Set the number of quality levels. Allow up to 6
+	    static UInt32 sNumQualityLevels = 6;
+	    theErr = QTSS_SetValue(newStream, qtssRTPStrNumQualityLevels, 0, &sNumQualityLevels, sizeof(sNumQualityLevels));
+	    Assert(theErr == QTSS_NoErr);
+
+	    // Get the SSRC of this track
+	    UInt32* theTrackSSRC = NULL;
+	    UInt32 theTrackSSRCSize = 0;
+	    (void)QTSS_GetValuePtr(newStream, qtssRTPStrSSRC, 0, (void**)&theTrackSSRC, &theTrackSSRCSize);
+
+	    // The RTP stream should ALWAYS have an SSRC assuming QTSS_AddStream succeeded.
+	    Assert((theTrackSSRC != NULL) && (theTrackSSRCSize == sizeof(UInt32)));
+
+	    //give the file some info it needs.
+	    theFile->SetSSRC(theTrackSSRC);
+	    theFile->SetCookies(newStream, thePayloadType);
+
+	    StrPtrLen theHeader;
+//	    theErr = QTSS_GetValuePtr(inParamBlock->inRTSPHeaders, qtssXRTPMetaInfoHeader, 0, (void**)&theHeader.Ptr, &theHeader.Len);
+//	    if (theErr == QTSS_NoErr)
+//	    {
+//	        //
+//	        // If there is an x-RTP-Meta-Info header in the request, mirror that header in the
+//	        // response. We will support any fields supported by the QTFileLib.
+//	        RTPMetaInfoPacket::FieldID* theFields = NEW RTPMetaInfoPacket::FieldID[RTPMetaInfoPacket::kNumFields];
+//	        ::memcpy(theFields, QTRTPFile::GetSupportedRTPMetaInfoFields(), sizeof(RTPMetaInfoPacket::FieldID) * RTPMetaInfoPacket::kNumFields);
+//
+//	        //
+//	        // This function does the work of appending the response header based on the
+//	        // fields we support and the requested fields.
+//	        theErr = QTSSModuleUtils::AppendRTPMetaInfoHeader(inParamBlock->inRTSPRequest, &theHeader, theFields);
+//
+//	        //
+//	        // This returns QTSS_NoErr only if there are some valid, useful fields
+//	        Bool16 isVideo = false;
+//	        if (thePayloadType == qtssVideoPayloadType)
+//	            isVideo = true;
+//	        if (theErr == QTSS_NoErr)
+//	            theFile->fFile.SetTrackRTPMetaInfo(theTrackID, theFields, isVideo);
+//	    }
+
+	    //Should I ingore the fllowing part?
+	    // Our array has now been updated to reflect the fields requested by the client.
+	    //send the setup response
+	    //(void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssLastModifiedHeader,
+	    //                            theFile->fFile.GetQTFile()->GetModDateStr(), DateBuffer::kDateBufferLen);
+	    //(void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssCacheControlHeader,
+	    //                            kCacheControlHeader.Ptr, kCacheControlHeader.Len);
+	    theErr = QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, newStream, 0);
+	    Assert(theErr == QTSS_NoErr);
+	    return QTSS_NoErr;
 }
 
 
@@ -1189,64 +1302,64 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
 {
     QTRTPFile::ErrorCode qtFileErr = QTRTPFile::errNoError;
 
-    if (isSDP(inParamBlock))
-    {
-        StrPtrLen pathStr;
-        (void)QTSS_LockObject(inParamBlock->inRTSPRequest);
-        (void)QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, (void**)&pathStr.Ptr, &pathStr.Len);
-        QTSS_Error err = QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest, qtssClientNotFound, sNoSDPFileFoundErr, &pathStr);
-        (void)QTSS_UnlockObject(inParamBlock->inRTSPRequest);
-        return err;
-    }
+//    if (isSDP(inParamBlock))
+//    {
+//        StrPtrLen pathStr;
+//        (void)QTSS_LockObject(inParamBlock->inRTSPRequest);
+//        (void)QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqFilePath, 0, (void**)&pathStr.Ptr, &pathStr.Len);
+//        QTSS_Error err = QTSSModuleUtils::SendErrorResponse(inParamBlock->inRTSPRequest, qtssClientNotFound, sNoSDPFileFoundErr, &pathStr);
+//        (void)QTSS_UnlockObject(inParamBlock->inRTSPRequest);
+//        return err;
+//    }
 
-    FileSession** theFile = NULL;
+    TSFileSession** theFile = NULL;
     UInt32 theLen = 0;
     QTSS_Error theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
     if ((theErr != QTSS_NoErr) || (theLen != sizeof(FileSession*)))
         return QTSS_RequestFailed;
 
-    theErr = SetupCacheBuffers(inParamBlock, theFile);  
-    if (theErr != QTSS_NoErr)
-        return theErr;
+//    theErr = SetupCacheBuffers(inParamBlock, theFile);
+//    if (theErr != QTSS_NoErr)
+//        return theErr;
     
     //make sure to clear the next packet the server would have sent!
-    (*theFile)->fPacketStruct.packetData = NULL;
+//    (*theFile)->fPacketStruct.packetData = NULL;
 
     // Set the default quality before playing.
     QTRTPFile::RTPTrackListEntry* thePacketTrack;
-    for (UInt32 x = 0; x < (*theFile)->fSDPSource.GetNumStreams(); x++)
-    {
-         SourceInfo::StreamInfo* theStreamInfo = (*theFile)->fSDPSource.GetStreamInfo(x);
-         if (!(*theFile)->fFile.FindTrackEntry(theStreamInfo->fTrackID,&thePacketTrack))
-            break;
-         //(*theFile)->fFile.SetTrackQualityLevel(thePacketTrack, QTRTPFile::kAllPackets);
-         (*theFile)->fFile.SetTrackQualityLevel(thePacketTrack, sDefaultStreamingQuality);
-    }
+//    for (UInt32 x = 0; x < (*theFile)->fSDPSource.GetNumStreams(); x++)
+//    {
+//         SourceInfo::StreamInfo* theStreamInfo = (*theFile)->fSDPSource.GetStreamInfo(x);
+//         if (!(*theFile)->fFile.FindTrackEntry(theStreamInfo->fTrackID,&thePacketTrack))
+//            break;
+//         //(*theFile)->fFile.SetTrackQualityLevel(thePacketTrack, QTRTPFile::kAllPackets);
+//         (*theFile)->fFile.SetTrackQualityLevel(thePacketTrack, sDefaultStreamingQuality);
+//    }
 
 
     // How much are we going to tell the client to back up?
     Float32 theBackupTime = 0;
 
     char* thePacketRangeHeader = NULL;
-    theErr = QTSS_GetValuePtr(inParamBlock->inRTSPHeaders, qtssXPacketRangeHeader, 0, (void**)&thePacketRangeHeader, &theLen);
-    if (theErr == QTSS_NoErr)
-    {
-        StrPtrLen theRangeHdrPtr(thePacketRangeHeader, theLen);
-        StringParser theRangeParser(&theRangeHdrPtr);
-        
-        theRangeParser.ConsumeUntil(NULL, StringParser::sDigitMask);
-        UInt64 theStartPN = theRangeParser.ConsumeInteger();
-        
-        theRangeParser.ConsumeUntil(NULL, StringParser::sDigitMask);
-        (*theFile)->fStopPN = theRangeParser.ConsumeInteger();
-
-        theRangeParser.ConsumeUntil(NULL, StringParser::sDigitMask);
-        (*theFile)->fStopTrackID = theRangeParser.ConsumeInteger();
-
-        qtFileErr = (*theFile)->fFile.SeekToPacketNumber((*theFile)->fStopTrackID, theStartPN);
-        (*theFile)->fStartTime = (*theFile)->fFile.GetRequestedSeekTime();
-    }
-    else
+//    theErr = QTSS_GetValuePtr(inParamBlock->inRTSPHeaders, qtssXPacketRangeHeader, 0, (void**)&thePacketRangeHeader, &theLen);
+//    if (theErr == QTSS_NoErr)
+//    {
+//        StrPtrLen theRangeHdrPtr(thePacketRangeHeader, theLen);
+//        StringParser theRangeParser(&theRangeHdrPtr);
+//
+//        theRangeParser.ConsumeUntil(NULL, StringParser::sDigitMask);
+//        UInt64 theStartPN = theRangeParser.ConsumeInteger();
+//
+//        theRangeParser.ConsumeUntil(NULL, StringParser::sDigitMask);
+//        (*theFile)->fStopPN = theRangeParser.ConsumeInteger();
+//
+//        theRangeParser.ConsumeUntil(NULL, StringParser::sDigitMask);
+//        (*theFile)->fStopTrackID = theRangeParser.ConsumeInteger();
+//
+//        qtFileErr = (*theFile)->fFile.SeekToPacketNumber((*theFile)->fStopTrackID, theStartPN);
+//        (*theFile)->fStartTime = (*theFile)->fFile.GetRequestedSeekTime();
+//    }
+//    else
     {
         Float64* theStartTimeP = NULL;
         Float64 currentTime = 0;
@@ -1254,9 +1367,9 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
         if ((theErr != QTSS_NoErr) || (theLen != sizeof(Float64)))
         {   // No start time so just start at the last packet ready to send
             // This packet could be somewhere out in the middle of the file.
-             currentTime =  (*theFile)->fFile.GetFirstPacketTransmitTime(); 
-             theStartTimeP = &currentTime;  
-             (*theFile)->fStartTime = currentTime;
+//             currentTime =  (*theFile)->fFile.GetFirstPacketTransmitTime();
+//             theStartTimeP = &currentTime;
+//             (*theFile)->fStartTime = currentTime;
         }    
 
         Float32* theMaxBackupTime = NULL;
@@ -1268,40 +1381,40 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
             //
             // If this is an old client (doesn't send the x-prebuffer header) or an mp4 client, 
             // - don't back up to a key frame, and do not adjust the buffer time
-            qtFileErr = (*theFile)->fFile.Seek(*theStartTimeP, 0);
-            (*theFile)->fStartTime = *theStartTimeP;
+//            qtFileErr = (*theFile)->fFile.Seek(*theStartTimeP, 0);
+//            (*theFile)->fStartTime = *theStartTimeP;
            
             //
             // burst out -transmit time packets
-            (*theFile)->fAllowNegativeTTs = false;
+//            (*theFile)->fAllowNegativeTTs = false;
         }
         else
         {
-            qtFileErr = (*theFile)->fFile.Seek(*theStartTimeP, *theMaxBackupTime);
-            Float64 theFirstPacketTransmitTime = (*theFile)->fFile.GetFirstPacketTransmitTime();
-            theBackupTime = (Float32) ( *theStartTimeP - theFirstPacketTransmitTime);
-            
-            //
-            // For oddly authored movies, there are situations in which the packet
-            // transmit time can be before the sample time. In that case, the backup
-            // time may exceed the max backup time. In that case, just make the backup
-            // time the max backup time.
-            if (theBackupTime > *theMaxBackupTime)
-                theBackupTime = *theMaxBackupTime;
-            //
-            // If client specifies that it can do extra buffering (new client), use the first
-            // packet transmit time as the start time for this play burst. We don't need to
-            // burst any packets because the client can do the extra buffering
-			Bool16* overBufferEnabledPtr = NULL;
-			theLen = 0;
-			theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, qtssCliSesOverBufferEnabled, 0, (void**)&overBufferEnabledPtr, &theLen);	
-			if ((theErr == QTSS_NoErr) && (theLen == sizeof(Bool16)) && *overBufferEnabledPtr)
-				(*theFile)->fStartTime = *theStartTimeP;
-			else
-                (*theFile)->fStartTime = *theStartTimeP - theBackupTime;            
-
-
-            (*theFile)->fAllowNegativeTTs = true;
+//            qtFileErr = (*theFile)->fFile.Seek(*theStartTimeP, *theMaxBackupTime);
+//            Float64 theFirstPacketTransmitTime = (*theFile)->fFile.GetFirstPacketTransmitTime();
+//            theBackupTime = (Float32) ( *theStartTimeP - theFirstPacketTransmitTime);
+//
+//            //
+//            // For oddly authored movies, there are situations in which the packet
+//            // transmit time can be before the sample time. In that case, the backup
+//            // time may exceed the max backup time. In that case, just make the backup
+//            // time the max backup time.
+//            if (theBackupTime > *theMaxBackupTime)
+//                theBackupTime = *theMaxBackupTime;
+//            //
+//            // If client specifies that it can do extra buffering (new client), use the first
+//            // packet transmit time as the start time for this play burst. We don't need to
+//            // burst any packets because the client can do the extra buffering
+//			Bool16* overBufferEnabledPtr = NULL;
+//			theLen = 0;
+//			theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, qtssCliSesOverBufferEnabled, 0, (void**)&overBufferEnabledPtr, &theLen);
+//			if ((theErr == QTSS_NoErr) && (theLen == sizeof(Bool16)) && *overBufferEnabledPtr)
+//				(*theFile)->fStartTime = *theStartTimeP;
+//			else
+//                (*theFile)->fStartTime = *theStartTimeP - theBackupTime;
+//
+//
+//            (*theFile)->fAllowNegativeTTs = true;
         }
     }
     
@@ -1320,27 +1433,27 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
                                                     qtssClientBadRequest, sSeekToNonexistentTimeErr);
                                                         
     //make sure to clear the next packet the server would have sent!
-    (*theFile)->fPacketStruct.packetData = NULL;
+//    (*theFile)->fPacketStruct.packetData = NULL;
     
     // Set the movie duration and size parameters
-    Float64 movieDuration = (*theFile)->fFile.GetMovieDuration();
+    Float64 movieDuration = 77.000000;//(*theFile)->fFile.GetMovieDuration();
     (void)QTSS_SetValue(inParamBlock->inClientSession, qtssCliSesMovieDurationInSecs, 0, &movieDuration, sizeof(movieDuration));
     
-    UInt64 movieSize = (*theFile)->fFile.GetAddedTracksRTPBytes();
+    UInt64 movieSize = 11610692;//(*theFile)->fFile.GetAddedTracksRTPBytes();
     (void)QTSS_SetValue(inParamBlock->inClientSession, qtssCliSesMovieSizeInBytes, 0, &movieSize, sizeof(movieSize));
     
-    UInt32 bitsPerSecond =  (*theFile)->fFile.GetBytesPerSecond() * 8;
+    UInt32 bitsPerSecond =  1191000;//(*theFile)->fFile.GetBytesPerSecond() * 8;
     (void)QTSS_SetValue(inParamBlock->inClientSession, qtssCliSesMovieAverageBitRate, 0, &bitsPerSecond, sizeof(bitsPerSecond));
 
     Bool16 adjustPauseTime = kAddPauseTimeToRTPTime; //keep rtp time stamps monotonically increasing
     if ( true == QTSSModuleUtils::HavePlayerProfile( sServerPrefs, inParamBlock,QTSSModuleUtils::kDisablePauseAdjustedRTPTime) )
     	adjustPauseTime = kDontAddPauseTimeToRTPTime;
     
-	if (sPlayerCompatibility )  // don't change adjust setting if compatibility is off. 
-		(**theFile).fAdjustPauseTime = adjustPauseTime;
+//	if (sPlayerCompatibility )  // don't change adjust setting if compatibility is off.
+//		(**theFile).fAdjustPauseTime = adjustPauseTime;
 	
-    if ( (**theFile).fLastPauseTime > 0 )
-        (**theFile).fTotalPauseTime += OS::Milliseconds() - (**theFile).fLastPauseTime;
+//    if ( (**theFile).fLastPauseTime > 0 )
+//        (**theFile).fTotalPauseTime += OS::Milliseconds() - (**theFile).fLastPauseTime;
 
     //
     // For the purposes of the speed header, check to make sure all tracks are
@@ -1349,116 +1462,116 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
     
     // Set the timestamp & sequence number parameters for each track.
     QTSS_RTPStreamObject* theRef = NULL;
-    for (   UInt32 theStreamIndex = 0;
-            QTSS_GetValuePtr(inParamBlock->inClientSession, qtssCliSesStreamObjects, theStreamIndex, (void**)&theRef, &theLen) == QTSS_NoErr;
-            theStreamIndex++)
-    {
-        UInt32* theTrackID = NULL;
-        theErr = QTSS_GetValuePtr(*theRef, qtssRTPStrTrackID, 0, (void**)&theTrackID, &theLen);
-        Assert(theErr == QTSS_NoErr);
-        Assert(theTrackID != NULL);
-        Assert(theLen == sizeof(UInt32));
-        
-        UInt16 theSeqNum = 0;
-        UInt32 theTimestamp = (*theFile)->fFile.GetSeekTimestamp(*theTrackID); // this is the base timestamp need to add in paused time.        
-
-        Assert(theRef != NULL);
-
-        if ((**theFile).fAdjustPauseTime)
-        {
-            UInt32* theTimescale = NULL;
-            QTSS_GetValuePtr(*theRef, qtssRTPStrTimescale, 0,  (void**)&theTimescale, &theLen);
-            if (theLen != 0) // adjust the timestamps to reflect paused time else leave it alone we can't calculate the timestamp without a timescale.
-            {
-                UInt32 pauseTimeStamp = CalculatePauseTimeStamp( *theTimescale,  (*theFile)->fTotalPauseTime, (UInt32) theTimestamp);
-                if (pauseTimeStamp != theTimestamp)
-                      theTimestamp = pauseTimeStamp;
-            }
-        }
-        
-	    theSeqNum = (*theFile)->fFile.GetNextTrackSequenceNumber(*theTrackID);       
-        theErr = QTSS_SetValue(*theRef, qtssRTPStrFirstSeqNumber, 0, &theSeqNum, sizeof(theSeqNum));
-        Assert(theErr == QTSS_NoErr);
-        theErr = QTSS_SetValue(*theRef, qtssRTPStrFirstTimestamp, 0, &theTimestamp, sizeof(theTimestamp));
-        Assert(theErr == QTSS_NoErr);
-
-        if (allTracksReliable)
-        {
-            QTSS_RTPTransportType theTransportType = qtssRTPTransportTypeUDP;
-            theLen = sizeof(theTransportType);
-            theErr = QTSS_GetValue(*theRef, qtssRTPStrTransportType, 0, &theTransportType, &theLen);
-            Assert(theErr == QTSS_NoErr);
-            
-            if (theTransportType == qtssRTPTransportTypeUDP)
-                allTracksReliable = false;
-        }
-    }
+//    for (   UInt32 theStreamIndex = 0;
+//            QTSS_GetValuePtr(inParamBlock->inClientSession, qtssCliSesStreamObjects, theStreamIndex, (void**)&theRef, &theLen) == QTSS_NoErr;
+//            theStreamIndex++)
+//    {
+//        UInt32* theTrackID = NULL;
+//        theErr = QTSS_GetValuePtr(*theRef, qtssRTPStrTrackID, 0, (void**)&theTrackID, &theLen);
+//        Assert(theErr == QTSS_NoErr);
+//        Assert(theTrackID != NULL);
+//        Assert(theLen == sizeof(UInt32));
+//
+//        UInt16 theSeqNum = 0;
+//        UInt32 theTimestamp = (*theFile)->fFile.GetSeekTimestamp(*theTrackID); // this is the base timestamp need to add in paused time.
+//
+//        Assert(theRef != NULL);
+//
+//        if ((**theFile).fAdjustPauseTime)
+//        {
+//            UInt32* theTimescale = NULL;
+//            QTSS_GetValuePtr(*theRef, qtssRTPStrTimescale, 0,  (void**)&theTimescale, &theLen);
+//            if (theLen != 0) // adjust the timestamps to reflect paused time else leave it alone we can't calculate the timestamp without a timescale.
+//            {
+//                UInt32 pauseTimeStamp = CalculatePauseTimeStamp( *theTimescale,  (*theFile)->fTotalPauseTime, (UInt32) theTimestamp);
+//                if (pauseTimeStamp != theTimestamp)
+//                      theTimestamp = pauseTimeStamp;
+//            }
+//        }
+//
+//	    theSeqNum = (*theFile)->fFile.GetNextTrackSequenceNumber(*theTrackID);
+//        theErr = QTSS_SetValue(*theRef, qtssRTPStrFirstSeqNumber, 0, &theSeqNum, sizeof(theSeqNum));
+//        Assert(theErr == QTSS_NoErr);
+//        theErr = QTSS_SetValue(*theRef, qtssRTPStrFirstTimestamp, 0, &theTimestamp, sizeof(theTimestamp));
+//        Assert(theErr == QTSS_NoErr);
+//
+//        if (allTracksReliable)
+//        {
+//            QTSS_RTPTransportType theTransportType = qtssRTPTransportTypeUDP;
+//            theLen = sizeof(theTransportType);
+//            theErr = QTSS_GetValue(*theRef, qtssRTPStrTransportType, 0, &theTransportType, &theLen);
+//            Assert(theErr == QTSS_NoErr);
+//
+//            if (theTransportType == qtssRTPTransportTypeUDP)
+//                allTracksReliable = false;
+//        }
+//    }
     
     //Tell the QTRTPFile whether repeat packets are wanted based on the transport
     // we don't care if it doesn't set (i.e. this is a meta info session)
-     (void)  (*theFile)->fFile.SetDropRepeatPackets(allTracksReliable);// if alltracks are reliable then drop repeat packets.
+//     (void)  (*theFile)->fFile.SetDropRepeatPackets(allTracksReliable);// if alltracks are reliable then drop repeat packets.
         
     //
     // This module supports the Speed header if the client wants the stream faster than normal.
     Float32 theSpeed = 1;
-    theLen = sizeof(theSpeed);
-    theErr = QTSS_GetValue(inParamBlock->inRTSPRequest, qtssRTSPReqSpeed, 0, &theSpeed, &theLen);
-    Assert(theErr != QTSS_BadArgument);
-    Assert(theErr != QTSS_NotEnoughSpace);
+//    theLen = sizeof(theSpeed);
+//    theErr = QTSS_GetValue(inParamBlock->inRTSPRequest, qtssRTSPReqSpeed, 0, &theSpeed, &theLen);
+//    Assert(theErr != QTSS_BadArgument);
+//    Assert(theErr != QTSS_NotEnoughSpace);
+//
+//    if (theErr == QTSS_NoErr)
+//    {
+//        if (theSpeed > sMaxAllowedSpeed)
+//            theSpeed = sMaxAllowedSpeed;
+//        if ((theSpeed <= 0) || (!allTracksReliable))
+//            theSpeed = 1;
+//    }
+//
+//    (*theFile)->fSpeed = theSpeed;
     
-    if (theErr == QTSS_NoErr)
-    {
-        if (theSpeed > sMaxAllowedSpeed)
-            theSpeed = sMaxAllowedSpeed;
-        if ((theSpeed <= 0) || (!allTracksReliable))
-            theSpeed = 1;
-    }
-    
-    (*theFile)->fSpeed = theSpeed;
-    
-    if (theSpeed != 1)
-    {
-        //
-        // If our speed is not 1, append the RTSP speed header in the response
-        char speedBuf[32];
-        qtss_sprintf(speedBuf, "%10.5f", theSpeed);
-        StrPtrLen speedBufPtr(speedBuf);
-        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssSpeedHeader,
-                                    speedBufPtr.Ptr, speedBufPtr.Len);
-    }
+//    if (theSpeed != 1)
+//    {
+//        //
+//        // If our speed is not 1, append the RTSP speed header in the response
+//        char speedBuf[32];
+//        qtss_sprintf(speedBuf, "%10.5f", theSpeed);
+//        StrPtrLen speedBufPtr(speedBuf);
+//        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssSpeedHeader,
+//                                    speedBufPtr.Ptr, speedBufPtr.Len);
+//    }
     
     //
     // Record the requested stop time, if there is one
-    (*theFile)->fStopTime = -1;
-    theLen = sizeof((*theFile)->fStopTime);
-    theErr = QTSS_GetValue(inParamBlock->inRTSPRequest, qtssRTSPReqStopTime, 0, &(*theFile)->fStopTime, &theLen);
-    
-    //
-    // Append x-Prebuffer header if provided & nonzero prebuffer needed
-    if (theBackupTime > 0)
-    {
-        char prebufferBuf[32];
-        qtss_sprintf(prebufferBuf, "time=%.5f", theBackupTime);
-        StrPtrLen backupTimePtr(prebufferBuf);
-        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssXPreBufferHeader,
-                                    backupTimePtr.Ptr, backupTimePtr.Len);
-    
-    }
+//    (*theFile)->fStopTime = -1;
+//    theLen = sizeof((*theFile)->fStopTime);
+//    theErr = QTSS_GetValue(inParamBlock->inRTSPRequest, qtssRTSPReqStopTime, 0, &(*theFile)->fStopTime, &theLen);
+//
+//    //
+//    // Append x-Prebuffer header if provided & nonzero prebuffer needed
+//    if (theBackupTime > 0)
+//    {
+//        char prebufferBuf[32];
+//        qtss_sprintf(prebufferBuf, "time=%.5f", theBackupTime);
+//        StrPtrLen backupTimePtr(prebufferBuf);
+//        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssXPreBufferHeader,
+//                                    backupTimePtr.Ptr, backupTimePtr.Len);
+//
+//    }
 
     // add the range header.
-    {
-        char rangeHeader[64];
-        if (-1 == (*theFile)->fStopTime)
-           (*theFile)->fStopTime = (*theFile)->fFile.GetMovieDuration();
-           
-        qtss_snprintf(rangeHeader,sizeof(rangeHeader) -1, "npt=%.5f-%.5f", (*theFile)->fStartTime, (*theFile)->fStopTime);
-        rangeHeader[sizeof(rangeHeader) -1] = 0;
-        
-        StrPtrLen rangeHeaderPtr(rangeHeader);
-        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssRangeHeader,
-                                    rangeHeaderPtr.Ptr, rangeHeaderPtr.Len);
-    
-    }
+//    {
+//        char rangeHeader[64];
+//        if (-1 == (*theFile)->fStopTime)
+//           (*theFile)->fStopTime = (*theFile)->fFile.GetMovieDuration();
+//
+//        qtss_snprintf(rangeHeader,sizeof(rangeHeader) -1, "npt=%.5f-%.5f", (*theFile)->fStartTime, (*theFile)->fStopTime);
+//        rangeHeader[sizeof(rangeHeader) -1] = 0;
+//
+//        StrPtrLen rangeHeaderPtr(rangeHeader);
+//        (void)QTSS_AppendRTSPHeader(inParamBlock->inRTSPRequest, qtssRangeHeader,
+//                                    rangeHeaderPtr.Ptr, rangeHeaderPtr.Len);
+//
+//    }
     (void)QTSS_SendStandardRTSPResponse(inParamBlock->inRTSPRequest, inParamBlock->inClientSession, qtssPlayRespWriteTrackInfo);
 
     SInt64 adjustRTPStreamStartTimeMilli = 0;
@@ -1467,7 +1580,7 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
 
    //Tell the server to start playing this movie. We do want it to send RTCP SRs, but
     //we DON'T want it to write the RTP header
-    (*theFile)->fPaused = false;
+   // (*theFile)->fPaused = false;
     theErr = QTSS_Play(inParamBlock->inClientSession, inParamBlock->inRTSPRequest, qtssPlayFlagsSendRTCP);
     if (theErr != QTSS_NoErr)
        return theErr;
@@ -1479,255 +1592,45 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
     Assert(theErr == QTSS_NoErr);
     Assert(thePlayTime != NULL);
     Assert(theLen == sizeof(SInt64));
-    if (thePlayTime != NULL)
-        (*theFile)->fAdjustedPlayTime = adjustRTPStreamStartTimeMilli + *thePlayTime - ((SInt64)((*theFile)->fStartTime * 1000) );
+//    if (thePlayTime != NULL)
+//        (*theFile)->fAdjustedPlayTime = adjustRTPStreamStartTimeMilli + *thePlayTime - ((SInt64)((*theFile)->fStartTime * 1000) );
  
     return QTSS_NoErr;
 }
 
+void *SendPacketThread(void *inArg)
+{
+	TSFileSession *theFile =(TSFileSession *)inArg;
+	//Send packets
+	while(true)
+	{
+		SInt64 currentTime = OS::Milliseconds();
+		//Read packets and make an rtp packet
+		SInt32 rtpLength = theFile->Read7PacketsAndMakeRtp(currentTime);
+		//Send it
+		UInt32 err = QTSS_Write(globalStream, &(theFile->oRtpPacket.m_oPacket), rtpLength, NULL, qtssWriteFlagsIsRTP);
+		usleep(theFile->fWaitTime * 0.8 * 1000);
+	}
+}
+
 QTSS_Error SendPackets(QTSS_RTPSendPackets_Params* inParams)
 {
-	QTSS_Object theStream = NULL;
-	bool isBeginningOfWriteBurst = true;
-	if(theStream == NULL)
+
+
+	if(globalStream == NULL)
 	{
-		FileSession** theFile = NULL;
+		TSFileSession** theFile = NULL;
 		UInt32 theLen = 0;
 		QTSS_Error theErr = QTSS_GetValuePtr(inParams->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
-
-		QTRTPFile::RTPTrackListEntry* theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-		Float64 theTransmitTime = (*theFile)->fFile.GetNextPacket((char**)&(*theFile)->fPacketStruct.packetData, &(*theFile)->fNextPacketLen);
-		theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-		theStream = (QTSS_Object)theLastPacketTrack->Cookie1;
+//		QTRTPFile::RTPTrackListEntry* theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
+//		Float64 theTransmitTime = (*theFile)->fFile.GetNextPacket((char**)&(*theFile)->fPacketStruct.packetData, &(*theFile)->fNextPacketLen);
+//		theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
+		globalStream = (QTSS_Object)((*theFile)->cookie1);
+		pthread_t tid;
+		pthread_create(&tid, NULL, SendPacketThread, (void*)(*theFile));
 	}
-	//Just test QTSS_Write, with which I am not sure whether can be used to send my own data, such as text?
-	char *theText = "Oh God, do you know how boring is it to read code sources?";
-	QTSS_PacketStruct theMyPacket;
-	theMyPacket.packetData = theText;
-	//Time when next packet will be sent
-	//5 seconds? I'm not that sure
-	int theTime = 2000;
-	//theStream = (QTSS_Object)theLastPacketTrack->Cookie1;
-	inParams->outNextPacketTime = theTime;
-	//((QTSS_PacketStruct*)theStream)->packetData = theText;
-	QTSS_Write(theStream, &theMyPacket, strlen(theText), NULL, qtssWriteFlagsIsRTP);
-
-
-
-//    static const UInt32 kQualityCheckIntervalInMsec = 250;  // v331=v107
-//    FileSession** theFile = NULL;
-//    UInt32 theLen = 0;
-//    QTSS_Error theErr = QTSS_GetValuePtr(inParams->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
-//    Assert(theErr == QTSS_NoErr);
-//    Assert(theLen == sizeof(FileSession*));
-//    bool isBeginningOfWriteBurst = true;
-//    QTSS_Object theStream = NULL;
-//
-//
-//    if ( theFile == NULL || (*theFile)->fStartTime == -1 || (*theFile)->fPaused == true ) //something is wrong
-//    {
-//        Assert( theFile != NULL );
-//        Assert( (*theFile)->fStartTime != -1 );
-//        Assert( (*theFile)->fPaused != true );
-//
-//        inParams->outNextPacketTime = qtssDontCallSendPacketsAgain;
-//        return QTSS_NoErr;
-//    }
-//
-//    if ( (*theFile)->fAdjustedPlayTime == 0 ) // this is system milliseconds
-//    {
-//        Assert( (*theFile)->fAdjustedPlayTime != 0 );
-//        inParams->outNextPacketTime = kQualityCheckIntervalInMsec;
-//        return QTSS_NoErr;
-//    }
-//
-//
-//    QTRTPFile::RTPTrackListEntry* theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-//
-//    while (true)
-//    {
-//        if ((*theFile)->fPacketStruct.packetData == NULL)
-//        {
-//            Float64 theTransmitTime = (*theFile)->fFile.GetNextPacket((char**)&(*theFile)->fPacketStruct.packetData, &(*theFile)->fNextPacketLen);
-//            if ( QTRTPFile::errNoError != (*theFile)->fFile.Error() )
-//            {
-//                QTSS_CliSesTeardownReason reason = qtssCliSesTearDownUnsupportedMedia;
-//                (void) QTSS_SetValue(inParams->inClientSession, qtssCliTeardownReason, 0, &reason, sizeof(reason));
-//                (void)QTSS_Teardown(inParams->inClientSession);
-//                return QTSS_RequestFailed;
-//            }
-//           theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-//
-//			if (theLastPacketTrack == NULL)
-//				break;
-//
-//            theStream = (QTSS_Object)theLastPacketTrack->Cookie1;
-//			Assert(theStream != NULL);
-//			if (theStream == NULL)
-//				return 0;
-//
-//
-//            //
-//            // Check to see if we should stop playing now
-//
-//            if (((*theFile)->fStopTime != -1) && (theTransmitTime > (*theFile)->fStopTime))
-//            {
-//                // We should indeed stop playing
-//                (void)QTSS_Pause(inParams->inClientSession);
-//                inParams->outNextPacketTime = qtssDontCallSendPacketsAgain;
-//
-//                (**theFile).fPaused = true;
-//                (**theFile).fLastPauseTime = OS::Milliseconds();
-//
-//                return QTSS_NoErr;
-//            }
-//            if (((*theFile)->fStopTrackID != 0) && ((*theFile)->fStopTrackID == theLastPacketTrack->TrackID) && (theLastPacketTrack->HTCB->fCurrentPacketNumber > (*theFile)->fStopPN))
-//            {
-//                // We should indeed stop playing
-//                (void)QTSS_Pause(inParams->inClientSession);
-//                inParams->outNextPacketTime = qtssDontCallSendPacketsAgain;
-//
-//                (**theFile).fPaused = true;
-//                (**theFile).fLastPauseTime = OS::Milliseconds();
-//
-//                return QTSS_NoErr;
-//            }
-//
-//            //
-//            // Find out what our play speed is. Send packets out at the specified rate,
-//            // and do so by altering the transmit time of the packet based on the Speed rate.
-//            Float64 theOffsetFromStartTime = theTransmitTime - (*theFile)->fStartTime;
-//            theTransmitTime = (*theFile)->fStartTime + (theOffsetFromStartTime / (*theFile)->fSpeed);
-//
-//            //
-//            // correct for first packet xmit times that are < 0
-//            if (( theTransmitTime < 0.0 ) && ( !(*theFile)->fAllowNegativeTTs ))
-//                theTransmitTime = 0.0;
-//
-//            (*theFile)->fPacketStruct.packetTransmitTime = (*theFile)->fAdjustedPlayTime + ((SInt64)(theTransmitTime * 1000));
-//
-//        }
-//
-//        //We are done playing all streams!
-//        if ((*theFile)->fPacketStruct.packetData == NULL)
-//        {
-//            //TODO not quite good to the last drop -- we -really- should guarantee this, also reflector
-//            // a write of 0 len to QTSS_Write will flush any buffered data if we're sending over tcp
-//            //(void)QTSS_Write((QTSS_Object)(*theFile)->fFile.GetLastPacketTrack()->Cookie1, NULL, 0, NULL, qtssWriteFlagsIsRTP);
-//            inParams->outNextPacketTime = qtssDontCallSendPacketsAgain;
-//            return QTSS_NoErr;
-//        }
-//
-//        //we have a packet that needs to be sent now
-//        Assert(theLastPacketTrack != NULL);
-//
-//        //If the stream is video, we need to make sure that QTRTPFile knows what quality level we're at
-//        //printf("inParams->inCurrentTime - (*theFile)->fLastQualityCheck = %lld\n", inParams->inCurrentTime - (*theFile)->fLastQualityCheck);
-//        if ( (!sDisableThinning) && (inParams->inCurrentTime > ((*theFile)->fLastQualityCheck + kQualityCheckIntervalInMsec) ) )
-//        {
-//            QTSS_RTPPayloadType thePayloadType = (QTSS_RTPPayloadType)theLastPacketTrack->Cookie2;
-//            if (thePayloadType == qtssVideoPayloadType)
-//            {
-//                (*theFile)->fLastQualityCheck = inParams->inCurrentTime;
-//
-//				theStream = (QTSS_Object)theLastPacketTrack->Cookie1;
-//				Assert(theStream != NULL);
-//				if (theStream == NULL)
-//					return 0;
-//
-//                // Get the current quality level in the stream, and this stream's TrackID.
-//                UInt32* theQualityLevel = 0;
-//                theErr = QTSS_GetValuePtr(theStream, qtssRTPStrQualityLevel, 0, (void**)&theQualityLevel, &theLen);
-//                Assert(theErr == QTSS_NoErr);
-//                Assert(theQualityLevel != NULL);
-//                Assert(theLen == sizeof(UInt32));
-//
-//                (*theFile)->fFile.SetTrackQualityLevel(theLastPacketTrack, *theQualityLevel);
-//            }
-//        }
-//
-//        // Send the packet!
-//        QTSS_WriteFlags theFlags = qtssWriteFlagsIsRTP;
-//        if (isBeginningOfWriteBurst)
-//            theFlags |= qtssWriteFlagsWriteBurstBegin;
-//
-//        theStream = (QTSS_Object)theLastPacketTrack->Cookie1;
-//		Assert(theStream != NULL);
-//		if (theStream == NULL)
-//			return 0;
-//
-//        //adjust the timestamp so it reflects paused time.
-//        void* packetDataPtr =  (*theFile)->fPacketStruct.packetData;
-//        UInt32 currentTimeStamp = GetPacketTimeStamp(packetDataPtr);
-//        UInt32 pauseTimeStamp = SetPausetimeTimeStamp(*theFile, theStream, currentTimeStamp);
-//
-//  		UInt16 curSeqNum = GetPacketSequenceNumber(theStream);
-//        (void) QTSS_SetValue(theStream, sRTPStreamLastPacketSeqNumAttrID, 0, &curSeqNum, sizeof(curSeqNum));
-//
-//        //Just test QTSS_Write, with which I am not sure whether can be used to send my own data, such as text?
-//        char *theText = "Oh God, do you know how boring is it to read code sources?";
-//        QTSS_PacketStruct theMyPacket;
-//        theMyPacket.packetData = theText;
-//        theMyPacket.packetTransmitTime =  (*theFile)->fPacketStruct.packetTransmitTime;
-//        theMyPacket.suggestedWakeupTime = 1000 * 5;
-//        (*theFile)->fPacketStruct.packetTransmitTime = 1000 * 5;
-//        //Time when next packet will be sent
-//        //5 seconds? I'm not that sure
-//        int theTime = 1000 * 5;
-//        //((QTSS_PacketStruct*)theStream)->packetData = theText;
-//
-//		//theErr = QTSS_Write(theStream, &(*theFile)->fPacketStruct, (*theFile)->fNextPacketLen, NULL, theFlags);
-//        theErr = QTSS_Write(theStream, &theMyPacket, strlen(theText), NULL, theFlags);
-//
-//        isBeginningOfWriteBurst = false;
-//
-//        if ( theErr == QTSS_WouldBlock )
-//        {
-//
-//            if (currentTimeStamp != pauseTimeStamp) // reset the packet time stamp so we adjust it again when we really do send it
-//               SetPacketTimeStamp(currentTimeStamp, packetDataPtr);
-//
-//            // In the case of a QTSS_WouldBlock error, the packetTransmitTime field of the packet struct will be set to
-//            // the time to wakeup, or -1 if not known.
-//            // If the time to wakeup is not given by the server, just give a fixed guess interval
-//            if ((*theFile)->fPacketStruct.suggestedWakeupTime == -1)
-//                inParams->outNextPacketTime = sFlowControlProbeInterval;    // for buffering, try me again in # MSec
-//            else
-//            {
-//                Assert((*theFile)->fPacketStruct.suggestedWakeupTime > inParams->inCurrentTime);
-//                //inParams->outNextPacketTime = (*theFile)->fPacketStruct.suggestedWakeupTime - inParams->inCurrentTime;
-//                //I hope you know this is just for test
-//                inParams->outNextPacketTime = theTime;
-//            }
-//
-//            //qtss_printf("Call again: %qd\n", inParams->outNextPacketTime);
-//
-//            return QTSS_NoErr;
-//        }
-//        else
-//        {
-//        	inParams->outNextPacketTime = theTime;
-//        	(void) QTSS_SetValue(theStream, sRTPStreamLastSentPacketSeqNumAttrID, 0, &curSeqNum, sizeof(curSeqNum));
-//        	(*theFile)->fPacketStruct.packetData = NULL;
-//        }
-//    }
-
-//	FileSession** theFile = NULL;
-//	UInt32 theLen = 0;
-//	QTSS_Error theErr = QTSS_GetValuePtr(inParams->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
-//	QTRTPFile::RTPTrackListEntry* theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-//	QTSS_Object theStream = (QTSS_Object)theLastPacketTrack->Cookie1;
-//
-//	Float64 theTransmitTime = (*theFile)->fFile.GetNextPacket((char**)&(*theFile)->fPacketStruct.packetData, &(*theFile)->fNextPacketLen);
-//	theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-//
-//    char *theText = "Hello, I am so glad to have a fullfilled life!";
-//    UInt32 theLength = 0;
-//    QTSS_PacketStruct thePacket;
-//    thePacket.packetData = theText;
-//    theErr = QTSS_Write(theStream, &thePacket, strlen(theText), &theLength, 0);
-//    printf("%s\n", theText);
-//    inParams->outNextPacketTime = 5000;
+	//Sleep time
+	inParams->outNextPacketTime = 100;
 	return QTSS_NoErr;
 }
 
@@ -1752,3 +1655,143 @@ void    DeleteFileSession(FileSession* inFileSession)
 {   
     delete inFileSession;
 }
+
+Bool16 GetPCR(unsigned char *p_ts_packet, SInt64 *p_pcr, SInt32 *p_pcr_pid)
+{
+	Assert(p_ts_packet != NULL);
+	SInt64 	lPcrBase = 0;
+	SInt32	nPcrExt = 0;
+	UInt32	nPsiPcr = 0;
+	*p_pcr = 0;
+	*p_pcr_pid = 0;
+	//FIXME
+	//nPsiPcr = ((p_ts_packet[1] >> 6) & 0x01);
+	if((p_ts_packet[0] == 0x47) && (p_ts_packet[3] & 0x20) && (p_ts_packet[5] & 0x10) && (p_ts_packet[4] >= 7))
+	{
+		*p_pcr_pid = ((SInt32)p_ts_packet[1] & 0x1F) << 8 | p_ts_packet[2];
+		lPcrBase =((SInt64)p_ts_packet[6] << 25)|((SInt64)p_ts_packet[7] << 17)|((SInt64)p_ts_packet[8] << 9)|((SInt64)p_ts_packet[9] << 1)|((SInt64)p_ts_packet[10] >> 7);
+		nPcrExt =  ((SInt32)p_ts_packet[10] & 0x0001) << 8| p_ts_packet[11];
+		*p_pcr = lPcrBase * 300 + nPcrExt;
+		return true;
+	}
+	return false;
+}
+
+
+Bool16 	TSFileSession::GetTwoPcr()
+{
+	SInt64	lPcr = 0;
+	SInt32	nPid = 0;
+	SInt32	nReadSize;
+	SInt32	nSeq = 0;
+	unsigned char pBufferForTsPacket[188];
+	do
+	{
+		nReadSize = fread(pBufferForTsPacket, 1, 188, pFile);
+		Assert(nReadSize == 188);
+		if(GetPCR(pBufferForTsPacket, &lPcr, &nPid) == true)
+		{
+			if(lFirstPcr == 0)
+			{
+				lFirstPcr = lPcr;
+				nFirstPcrSeq = nSeq;
+			}
+			else if(lSecondPcr == 0)
+			{
+				lSecondPcr = lPcr;
+				nSecondPcrSeq = nSeq;
+			}
+			else
+			{
+				break;
+			}
+		}
+		nSeq++;
+	}while(nReadSize);
+	//printf("firstpcr %lld seq %d\nsecondpcr %lld seq %d\n", lFirstPcr, nFirstPcrSeq, lSecondPcr, nSecondPcrSeq);
+	//Reset file pointer
+	int ret =fseek(pFile, 0L, 0);
+	//Compute bit rate and sleep time
+	fBitRate = (Float64)(nSecondPcrSeq - nFirstPcrSeq)*188*8*27000000/(lSecondPcr - lFirstPcr);
+	fWaitTime = (Float32)1000 * 188 * 8 * 7 / fBitRate;
+	//printf("bit rate %lf wait time %lf\n", fBitRate, fWaitTime);
+	if(lFirstPcr && lSecondPcr)
+	{
+		return true;
+	}
+	return false;
+}
+
+void TSFileSession::UpdatePcr(UInt64 lNewPcr, UInt32 nSeq)
+{
+//	static SInt32 trigger = 0;
+//	if(trigger++ == 20)
+//	{
+//		trigger = 0;
+//		printf("newpcr %lld seq %d\n", lNewPcr, nSeq);
+//	}
+	lFirstPcr = lSecondPcr;
+	nFirstPcrSeq = nSecondPcrSeq;
+	lSecondPcr = lNewPcr;
+	nSecondPcrSeq = nSeq;
+	//Compute the average bit rate
+	fBitRate = (Float64)(nSecondPcrSeq - nFirstPcrSeq)*188*8*27000000/(lSecondPcr - lFirstPcr);
+	fWaitTime = (Float32)1000 * 188 * 8 * 7 / fBitRate;
+	//printf("bit rate %lf wait time %lf\n", fBitRate, fWaitTime);
+}
+
+UInt32	TSFileSession::Read7PacketsAndMakeRtp(SInt64 inTimeStamp)
+{
+	SInt32 	readSize = 0;
+	SInt64	lPcr = 0;
+	SInt32	nPcrPid = 0;
+	lSizeOfBuffer = 0;
+	for(int i = 0; i < 7; i++)
+	{
+		readSize = fread(pBufferFor7Packets + lSizeOfBuffer, 1, 188, pFile);
+		if(readSize != 188)
+		{
+			break;
+		}
+		//Check whether we have a pcr
+		if(GetPCR(pBufferFor7Packets + lSizeOfBuffer, &lPcr, &nPcrPid))
+		{
+			UpdatePcr(lPcr, nCurrentTsPacketSeq);
+		}
+		//Record our reading track
+		lSizeOfBuffer += readSize;
+		nCurrentTsPacketSeq++;
+	}
+	//Create rtp
+	oRtpPacket.CreateRtp(pBufferFor7Packets, lSizeOfBuffer, 33, inTimeStamp, globalTrackSSRC, &nCurrentRtpPacketSeq, true);
+	//Return rtp packet length
+	return oRtpPacket.m_nRtpLength;
+}
+
+void Ts2Rtp::CreateRtp(unsigned char *inData, SInt32 inLength, SInt32 inPayloadType, SInt64 inTimeStamp, UInt32 inSSRC, SInt32 *ioSeqNum, Bool16 inMarker)
+{
+	Assert(inData != NULL && inLength > 0);
+
+	m_pBuffer[0] = 0x80;
+	m_pBuffer[1] = (inMarker ? 0x80 : 0x00) | inPayloadType;
+
+	m_pBuffer[2] = ((*ioSeqNum) >> 8) & 0xff;
+	m_pBuffer[3] = (*ioSeqNum) & 0xff;
+
+	m_pBuffer[4] = (unsigned char)(inTimeStamp >> 24) & 0xff;
+	m_pBuffer[5] = (unsigned char)(inTimeStamp >> 16) & 0xff;
+	m_pBuffer[6] = (unsigned char)(inTimeStamp >>  8) & 0xff;
+	m_pBuffer[7] = (unsigned char)inTimeStamp & 0xff;
+
+	m_pBuffer[ 8] = (inSSRC >> 24) & 0xff;
+	m_pBuffer[ 9] = (inSSRC >> 16) & 0xff;
+	m_pBuffer[10] = (inSSRC >>  8) & 0xff;
+	m_pBuffer[11] = inSSRC & 0xff;
+
+	(*ioSeqNum)++;
+
+	memcpy(m_pBuffer + 12, inData, inLength);
+	m_nRtpLength =  inLength + 12;
+	m_oPacket.packetData = m_pBuffer;
+}
+

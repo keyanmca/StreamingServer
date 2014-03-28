@@ -233,7 +233,6 @@ QTSS_Error RTPSession::AddStream(RTSPRequestInterface* request, RTPStream** outS
     }
 
     *outStream = NEW RTPStream(theSSRC, this);
-    
     QTSS_Error theErr = (*outStream)->Setup(request, inFlags);
     if (theErr != QTSS_NoErr)
         // If we couldn't setup the stream, make sure not to leak memory!
@@ -672,8 +671,8 @@ SInt64 RTPSession::Run()
     // only adjust the time to wake up if the next packet time is greater than the max retransmit delay +
     // the standard interval between wakeups.
 
-    //if (theParams.rtpSendPacketsParams.outNextPacketTime > (theRetransDelayInMsec + theSendInterval))
-    //    theParams.rtpSendPacketsParams.outNextPacketTime = theRetransDelayInMsec;
+    if (theParams.rtpSendPacketsParams.outNextPacketTime > (theRetransDelayInMsec + theSendInterval))
+        theParams.rtpSendPacketsParams.outNextPacketTime = theRetransDelayInMsec;
     
     Assert(theParams.rtpSendPacketsParams.outNextPacketTime >= 0);//we'd better not get deleted accidently!
     return theParams.rtpSendPacketsParams.outNextPacketTime;

@@ -9,7 +9,7 @@ CCFLAGS += $(COMPILER_FLAGS) $(INCLUDE_FLAG) ../../PlatformHeader.h -g -w
 LIBS = $(CORE_LINK_LIBS) $(SHARED) $(MODULE_LIBS) ../../CommonUtilitiesLib/libCommonUtilitiesLib.a ../../QTFileLib/libQTFileLib.a
 
 #OPTIMIZATION
-CCFLAGS += -O3
+CCFLAGS += -O0
 
 # EACH DIRECTORY WITH HEADERS MUST BE APPENDED IN THIS MANNER TO THE CCFLAGS
 
