@@ -32,9 +32,9 @@
 */
 
 #include <string.h>
-
+#include <sys/time.h>
+#include <pthread.h>
 #include "QTSSTSFileModule.h"
-
 #include "QTRTPFile.h"
 #include "QTFile.h"
 #include "OSMemory.h"
@@ -51,90 +51,206 @@
 #include <errno.h>
 
 #include "QTSS.h"
-
-class Ts2Rtp
-{
-public:
-	Ts2Rtp(){}
-	~Ts2Rtp(){}
-	void CreateRtp(unsigned char *inData, SInt32 inLength, SInt32 inPayloadType, SInt64 inTimeStamp, UInt32 inSSRC, SInt32 *ioSeqNum, Bool16 inMarker);
-	SInt32				m_nRtpLength;
-	unsigned char 		m_pBuffer[1500];
-	QTSS_PacketStruct	m_oPacket;
-};
-
-
-static const UInt32 TSPacketBytesMin = 188;
-static const UInt32 TSPacketPerRTP   = 7;
+#define	MAXFILETYPE (3)
+#define MAXSLICES (500)
+#define CBRMETHOD	1
 class TSFileSession
 {
 public:
-	TSFileSession(const char *szFilename):lFirstPcr(0), lSecondPcr(0), nFirstPcrSeq(0), nSecondPcrSeq(0), fBitRate(0.0),
-	fWaitTime(0.0), lCurrentPcrTime(0), lCurrentPcrPid(0), lSizeOfBuffer(0), nCurrentPos(0), nCurrentRtpPacketSeq(1988), nCurrentTsPacketSeq(0),
-	cookie1(NULL), cookie2(NULL), pSSRC(NULL)
+	TSFileSession(const char *szFilename):m_lFirstPcr(0), m_lSecondPcr(0), m_nFirstPcrSeq(0), m_nSecondPcrSeq(0), m_nBitRate(0),
+	m_lSleepTime(0), m_nCurrentRtpPacketSeq(1988), m_nCurrentTsPacketOffset(0), m_nSendRate(0),m_fLastRateFactor(1.0), m_fRateFactor(1.0),
+	cookie1(NULL), cookie2(NULL), m_pSSRC(NULL), m_bSliceHasChanged(false), m_nRtpXHeaderLength(12), m_nSendRateRingCursor(0), m_nLastBuffer(0)
 	{
-		pFile = NULL;
-		pFile = fopen(szFilename, "rb");
-		if(pFile)
+		strcpy(m_szFilePath, szFilename);
+		//We firstly open 3 files, which have different bitrate
+		char fileName[256] = {0};
+		for(int i = 0; i < 3; i++)
 		{
-			Assert(GetTwoPcr());
-			strcpy(szFileFullPath, szFilename);
+			sprintf(fileName, "%s%d.ts", szFilename, i);
+			m_FileArray[i].file = fopen(fileName, "rb");
+			Assert(m_FileArray[i].file != NULL);
+			fseek(m_FileArray[i].file, 0, SEEK_END);
+			m_FileArray[i].size = ftell(m_FileArray[i].file);
+			fseek(m_FileArray[i].file, 0, SEEK_SET);
 		}
+		//Load slices and I frame infomation
+		{
+			for(int i = 0; i < MAXFILETYPE; i++)
+			{
+				for(int j = 0; j < MAXSLICES; j++)
+				{
+					m_SliceOffset[i][j] = -1;
+					m_IFrameOffset[i][j] = -1;
+				}
+			}
+			sprintf(fileName, "%sfileinfo", szFilename);
+			FILE *pFileInfo = fopen(fileName, "r");
+			Assert(pFileInfo != NULL);
+			char id = 0;
+			int	type = -1;
+			int offset = -1;
+			int i = 0, j = 0;
+			int lastType = -1;
+			while(fscanf(pFileInfo, "%c\t%d\t%d", &id, &type, &offset) != EOF)
+			{
+				Assert(type != -1 && offset != -1);
+				if(lastType != type)
+				{
+					lastType = type;
+					i = 0;
+					j = 0;
+				}
+				if(id == 't')
+				{
+					//Calculate movie duration and average bitrate
+					m_FileArray[0].duration = m_FileArray[1].duration = m_FileArray[2].duration = offset;
+					m_FileArray[0].bitrate = m_FileArray[0].size * 8 / m_FileArray[0].duration;
+					m_FileArray[1].bitrate = m_FileArray[1].size * 8 / m_FileArray[1].duration;
+					m_FileArray[2].bitrate = m_FileArray[2].size * 8 / m_FileArray[2].duration;
+				}
+				else if(id == 's')
+				{
+					m_SliceOffset[type][i++] = offset;
+				}
+				else if(id == 'i')
+				{
+					m_IFrameOffset[type][j++] = offset;
+				}
+			}
+		}
+		pthread_mutex_init(&m_lock, NULL);
+		//Load test scripts
+		FILE *pscripts = fopen("script", "r");
+		char identifier[10] = {0};
+		SInt32  tick;
+		Float32 value;
+		m_Test.m_nCursor = 0;
+		while(fscanf(pscripts, "%s\t%d\t%f", identifier, &tick, &value) != EOF)
+		{
+			if(identifier[0] == '#')
+				continue;
+			if(strcmp(identifier, "interval") == 0)
+			{
+				m_nTimeInterval = value;
+			}
+			else if(strcmp(identifier, "switch") == 0)
+			{
+				m_Test.m_nTick[m_Test.m_nCursor] = tick;
+				m_Test.m_fValue[m_Test.m_nCursor] = value;
+				m_Test.m_nCursor++;
+			}
+			else if(strcmp(identifier, "startmode") == 0)
+			{
+				int x = (SInt32)value;
+				m_nCurrentSliceType = (SLICETYPE)x;
+				m_pCurrentFile = m_FileArray[x].file;
+				m_nBitRate = m_FileArray[m_nCurrentSliceType].bitrate;
+				m_lSleepTime = (SInt64)188 * 7 * 8 * 1000 * 1000 / m_nBitRate;
+			}
+		}
+		m_FileArray[0].correction = 1;
+		m_FileArray[1].correction = 1;
+		m_FileArray[2].correction = 1;
+		for(int i = 0; i < 4; i++)
+			m_nSendRateLast4Times[i] = -1;;
+		fileBitrate = fopen("bitrate", "w");
+		GetTwoPcr(0);
 	}
 	~TSFileSession()
 	{
-		if(pFile)
+		for(int i = 0; i < 3; i++)
 		{
-			fclose(pFile);
+			if(m_FileArray[i].file)
+			{
+				fclose(m_FileArray[i].file);
+				m_FileArray[i].file = NULL;
+			}
 		}
+		pthread_mutex_destroy(&m_lock);
 	}
-
-	QTSS_PacketStruct& operator &()
+	struct FileInfo
 	{
-		return oRtpPacket.m_oPacket;
-	}
-
-	UInt32	GetBitrateOf7Packets();
+		FILE	*file;
+		SInt32	duration;
+		SInt32	size;
+		SInt32	bitrate;
+		Float32	correction;
+	};
+	struct TestScript
+	{
+		SInt32	m_nTimeInterval;
+		SInt32	m_nTick[100];
+		Float32	m_fValue[100];
+		SInt32	m_nCursor;
+	};
+	struct FeedBack
+	{
+		UInt32 switchSlice;
+		UInt32 newSlice;
+		UInt32 expectedRate;
+		UInt32 clientassign;
+	};
+	SInt32 	m_nTimeInterval;
+	TestScript	m_Test;
+	FeedBack	m_FeedBack;
+	enum SLICETYPE{LOW = 0, MEDIUM, HIGH, };
+	//pcr
+	SInt64				m_lFirstPcr;
+	SInt64				m_lSecondPcr;
+	SInt32				m_nFirstPcrSeq;
+	SInt32				m_nSecondPcrSeq;
+	SInt32				m_nBitRate;
+	SInt32				m_nSendRate;
+	SInt32				m_nSendRateLast4Times[4];
+	SInt32				m_nSendRateRingCursor;
+	SInt64				m_lSleepTime;
+	SInt64				m_lLastTimeWeGetPcr;
+	//
+	FILE				*m_pCurrentFile;
+	FILE				*m_nNewCurrentFile;
+	FileInfo			m_FileArray[3];
+	char				m_szFilePath[256];
+	SInt32				m_nCurrentRtpPacketSeq;
+	void 				*cookie1;
+	UInt32 				cookie2;
+	UInt32				*m_pSSRC;
+	SDPSourceInfo		fSDPSource;
+	pthread_mutex_t 	m_lock;
+	unsigned char 		m_RtpBuffer[1500];
+	QTSS_PacketStruct	m_RtpPacket;
+	//Slice
+	SLICETYPE			m_nCurrentSliceType;
+	SLICETYPE 			m_nNewCurrentSliceType;
+	SInt32				m_nCurrentSlice;
+	SInt32				m_nCurrentTsPacketOffset;
+	SInt32	 			m_nNewCurrentTsPacketOffset;
+	bool				m_bSliceHasChanged;
+	//Store start positions for per slice
+	int 	m_SliceOffset[MAXFILETYPE][MAXSLICES];
+	//Store start positions for per I frame
+	int		m_IFrameOffset[MAXFILETYPE][MAXSLICES];
+	//Method
 	UInt32	Read7PacketsAndMakeRtp(SInt64 inTimeStamp);
 	void	UpdatePcr(UInt64 lNewPcr, UInt32 nSeq);
-	void	SetSSRC(UInt32 *inSSRC){pSSRC = inSSRC;}
+	void	SetSSRC(UInt32 *inSSRC){m_pSSRC = inSSRC;}
 	void 	SetCookies(void *inCookie1, UInt32 inCookie2){cookie1 = inCookie1; cookie2 = inCookie2;}
-
-	SInt64	lFirstPcr;
-	SInt64	lSecondPcr;
-	SInt32	nFirstPcrSeq;
-	SInt32	nSecondPcrSeq;
-
-	Float64	fBitRate;
-	Float32	fWaitTime;
-
-	SInt64	lCurrentPcrTime;
-	SInt64	lCurrentPcrPid;
-
-
-	unsigned char	pBufferFor7Packets[188 * 7];
-	SInt32			lSizeOfBuffer;
-
-	FILE	*pFile;
-	char	szFileFullPath[256];
-	SDPSourceInfo       fSDPSource;
-	//While reading file, we should record file position
-	SInt32	nCurrentPos;
-
-	SInt32	nCurrentRtpPacketSeq;
-	SInt32	nCurrentTsPacketSeq;
-
-	void 	*cookie1;
-	UInt32 	cookie2;
-	UInt32	*pSSRC;
-
-	//Rtp object
-	Ts2Rtp	oRtpPacket;
-private:
-	//Work only at start time so as to find out the first two pcr
-	//If false, ts file is invalid
-	Bool16 	GetTwoPcr();
-
+	Bool16 	GetTwoPcr(int inPacketOffset);
+	void 	GetNextPcr(int inPacketStartOffset);
+	UInt32 	CreateRtp(SInt32 inLength, SInt32 inPayloadType, SInt64 inTimeStamp, Bool16 inMarker);
+	UInt32	ChangeSlice(SLICETYPE inType);
+	SInt32	GetCurrentSliceIndex();
+	SInt32	GetIFramePosition(SLICETYPE inType, SInt32 inSliceIndex);
+	void 	FlowControl(UInt32 inJitter, UInt32 inBuffer, UInt32 inLoss);
+	Float32 GetAvgSendRate();
+	bool 	CheckAndDoChangeSlice(UInt32 inJitter);
+	void	ProbeHigherSendingRate(UInt32 inJitter, UInt32 inBuffer);
+	//For debug
+	//FILE 	*m_fileSendLog;
+	FILE *fileBitrate;
+	SInt32	m_nRtpXHeaderLength;
+	Float32	m_fRateFactor;
+	Float32 m_fLastRateFactor;
+	UInt32	m_nLastBuffer;
 };
 
 
@@ -179,8 +295,9 @@ class FileSession
 
 // ref to the prefs dictionary object
 
-static FileSession *theFileSession;
-static TSFileSession *theTSFileSession;
+static bool bStopSending = true;
+static bool bStart = true;
+static TSFileSession *theCurrentTSFileSession;
 
 static QTSS_ModulePrefsObject       sPrefs;
 static QTSS_PrefsObject             sServerPrefs;
@@ -267,6 +384,7 @@ static QTSS_Error Register(QTSS_Register_Params* inParams);
 static QTSS_Error Initialize(QTSS_Initialize_Params* inParamBlock);
 static QTSS_Error RereadPrefs();
 static QTSS_Error ProcessRTSPRequest(QTSS_StandardRTSP_Params* inParamBlock);
+static QTSS_Error ProcessRTCP(QTSS_RTCPProcess_Params* inParamBlock);
 static QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock);
 static QTSS_Error CreateQTTSFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath, TSFileSession** outFile);
 static QTSS_Error DoSetup(QTSS_StandardRTSP_Params* inParamBlock);
@@ -280,9 +398,6 @@ static void     BuildPrefBasedHeaders();
 //New addition by pengguokan
 //3/26/2014
 static Bool16 GetPCR(unsigned char *p_ts_packet, SInt64 *p_pcr, SInt32 *p_pcr_pid);
-static QTSS_Object globalStream = NULL;
-static UInt32 globalTrackSSRC = 0;
-
 
 
 QTSS_Error QTSSTSFileModule_Main(void* inPrivateArgs)
@@ -399,6 +514,8 @@ QTSS_Error  QTSSTSFileModuleDispatch(QTSS_Role inRole, QTSS_RoleParamPtr inParam
             return SendPackets(&inParamBlock->rtpSendPacketsParams);
         case QTSS_ClientSessionClosing_Role:
             return DestroySession(&inParamBlock->clientSessionClosingParams);
+        case QTSS_RTCPProcess_Role:
+        	return ProcessRTCP(&inParamBlock->rtcpProcessParams);
     }
     return QTSS_NoErr;
 }
@@ -409,7 +526,8 @@ QTSS_Error Register(QTSS_Register_Params* inParams)
     (void)QTSS_AddRole(QTSS_Initialize_Role);
     (void)QTSS_AddRole(QTSS_RTSPRequest_Role);
     (void)QTSS_AddRole(QTSS_RTPSendPackets_Role);
-    //(void)QTSS_AddRole(QTSS_ClientSessionClosing_Role);
+    (void)QTSS_AddRole(QTSS_RTCPProcess_Role);
+    (void)QTSS_AddRole(QTSS_ClientSessionClosing_Role);
     //(void)QTSS_AddRole(QTSS_RereadPrefs_Role);
 
     // Add text messages attributes
@@ -635,7 +753,6 @@ QTSS_Error RereadPrefs()
 
 QTSS_Error ProcessRTSPRequest(QTSS_StandardRTSP_Params* inParamBlock)
 {
-    printf("TSFileModule Process RTSP Request\n");
     QTSS_RTSPMethod* theMethod = NULL;
     UInt32 theMethodLen = 0;
     if ((QTSS_GetValuePtr(inParamBlock->inRTSPRequest, qtssRTSPReqMethod, 0,
@@ -708,6 +825,12 @@ Bool16 isSDP(QTSS_StandardRTSP_Params* inParamBlock);
 
 QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
 {
+	if(bStopSending == false)
+	{
+		bStopSending = true;
+		//bAlreadySending = false;
+		sleep(1);
+	}
     // Get the FileSession for this DESCRIBE, if any.
     UInt32 theLen = sizeof(FileSession*);
     TSFileSession*    theFile = NULL;
@@ -740,7 +863,7 @@ QTSS_Error DoDescribe(QTSS_StandardRTSP_Params* inParamBlock)
         //
         // There is already a file for this session. This can happen if there are multiple DESCRIBES,
         // or a DESCRIBE has been issued with a Session ID, or some such thing.
-        StrPtrLen   moviePath( theFile->szFileFullPath);
+        StrPtrLen   moviePath( theFile->m_szFilePath);
                 
 		// Stop playing because the new file isn't ready yet to send packets.
 		// Needs a Play request to get things going. SendPackets on the file is active if not paused.
@@ -1040,6 +1163,9 @@ A server implementing rate adaptation shall signal the "3GPP-Adaptation-Support"
 
 QTSS_Error CreateQTTSFile(QTSS_StandardRTSP_Params* inParamBlock, char* inPath, TSFileSession** outFile)
 {   
+	//At first we have to close down old client session
+
+
     *outFile = NEW TSFileSession(inPath);
     //FIXME Handle the sitituation of failing to open file
     //(*outFile)->fFile.SetAllowInvalidHintRefs(sAllowInvalidHintRefs);
@@ -1595,65 +1721,211 @@ QTSS_Error DoPlay(QTSS_StandardRTSP_Params* inParamBlock)
 //    if (thePlayTime != NULL)
 //        (*theFile)->fAdjustedPlayTime = adjustRTPStreamStartTimeMilli + *thePlayTime - ((SInt64)((*theFile)->fStartTime * 1000) );
  
+    bStart = true;
     return QTSS_NoErr;
-}
-
-void *SendPacketThread(void *inArg)
-{
-	TSFileSession *theFile =(TSFileSession *)inArg;
-	//Send packets
-	while(true)
-	{
-		SInt64 currentTime = OS::Milliseconds();
-		//Read packets and make an rtp packet
-		SInt32 rtpLength = theFile->Read7PacketsAndMakeRtp(currentTime);
-		//Send it
-		UInt32 err = QTSS_Write(globalStream, &(theFile->oRtpPacket.m_oPacket), rtpLength, NULL, qtssWriteFlagsIsRTP);
-		usleep(theFile->fWaitTime * 0.8 * 1000);
-	}
-}
-
-QTSS_Error SendPackets(QTSS_RTPSendPackets_Params* inParams)
-{
-
-
-	if(globalStream == NULL)
-	{
-		TSFileSession** theFile = NULL;
-		UInt32 theLen = 0;
-		QTSS_Error theErr = QTSS_GetValuePtr(inParams->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
-//		QTRTPFile::RTPTrackListEntry* theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-//		Float64 theTransmitTime = (*theFile)->fFile.GetNextPacket((char**)&(*theFile)->fPacketStruct.packetData, &(*theFile)->fNextPacketLen);
-//		theLastPacketTrack = (*theFile)->fFile.GetLastPacketTrack();
-		globalStream = (QTSS_Object)((*theFile)->cookie1);
-		pthread_t tid;
-		pthread_create(&tid, NULL, SendPacketThread, (void*)(*theFile));
-	}
-	//Sleep time
-	inParams->outNextPacketTime = 100;
-	return QTSS_NoErr;
 }
 
 QTSS_Error DestroySession(QTSS_ClientSessionClosing_Params* inParams)
 {
-    FileSession** theFile = NULL;
+    TSFileSession** theFile = NULL;
     UInt32 theLen = 0;
     QTSS_Error theErr = QTSS_GetValuePtr(inParams->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
-    if ((theErr != QTSS_NoErr) || (theLen != sizeof(FileSession*)) || (theFile == NULL))
+    if ((theErr != QTSS_NoErr) || (theLen != sizeof(TSFileSession*)) || (theFile == NULL))
         return QTSS_RequestFailed;
 
+    bStopSending = true;
     //
     // Tell the ClientSession how many samples we skipped because of stream thinning
-    UInt32 theNumSkippedSamples = (*theFile)->fFile.GetNumSkippedSamples();
-    (void)QTSS_SetValue(inParams->inClientSession, qtssCliSesFramesSkipped, 0, &theNumSkippedSamples, sizeof(theNumSkippedSamples));
-    
-    DeleteFileSession(*theFile);
+   // UInt32 theNumSkippedSamples = (*theFile)->fFile.GetNumSkippedSamples();
+   // (void)QTSS_SetValue(inParams->inClientSession, qtssCliSesFramesSkipped, 0, &theNumSkippedSamples, sizeof(theNumSkippedSamples));
+   // delete *theFile;
+   // DeleteFileSession(*theFile);
     return QTSS_NoErr;
 }
 
 void    DeleteFileSession(FileSession* inFileSession)
-{   
+{
     delete inFileSession;
+}
+
+Float32 flowcontrol = 1.0;
+
+//In my thought, sending thread should and must only do sending work without concerning about whether to change slice or others
+void *SendPacketThread(void *inArg)
+{
+#ifdef CBRMETHOD
+	TSFileSession *theFile =(TSFileSession *)inArg;
+	QTSS_Object currentStream = (QTSS_Object)(theFile->cookie1);
+	if(currentStream)
+	{
+		bStopSending = false;
+	}
+	SInt32 small = 0;
+	SInt32 large = 0;
+	SInt64 sleepTime = 0;
+	SInt64 timeStart = 0;
+	SInt32 timePeriod = theFile->m_nTimeInterval;
+	SInt32 sizeSent = 0;
+	SInt32 counter = 0;
+
+	//Send packets
+
+	while(bStopSending == false)
+	{
+		//When sending data, I won't be bothered by anyting
+		pthread_mutex_lock(&(theFile->m_lock));
+		SInt64 currentTime = OS::Milliseconds();
+		//Caclulate average sending bit rate
+		if(timeStart == 0)
+			timeStart = currentTime;
+		if(currentTime - timeStart >= timePeriod)
+		{
+
+			SInt64 n = 8000 * (SInt64)sizeSent / (currentTime - timeStart);
+			theFile->m_nSendRate = n;
+			theFile->m_nSendRateLast4Times[theFile->m_nSendRateRingCursor] = theFile->m_nSendRate;
+			if(theFile->m_nSendRate < 0)
+			{
+				printf("  \n");
+			}
+			theFile->m_nSendRateRingCursor = (theFile->m_nSendRateRingCursor + 1) % 4;
+			//printf("%d %dkbps\n", counter++, theFile->m_nSendRate / 1000);
+			sizeSent = 0;
+			timeStart = 0;
+			for(int i = 0; i < theFile->m_Test.m_nCursor; i++)
+			{
+				if(counter == theFile->m_Test.m_nTick[i])
+				{
+					flowcontrol = theFile->m_Test.m_fValue[i];
+					break;
+				}
+			}
+		}
+		//Read packets and make an rtp packet
+		SInt32 rtpLength = theFile->Read7PacketsAndMakeRtp(currentTime);
+		sleepTime = theFile->m_lSleepTime / flowcontrol / theFile->m_fRateFactor;
+		sizeSent += (rtpLength - 24);
+		//Maybe file has been sent out
+		if(rtpLength == 0)
+		{
+			pthread_mutex_unlock(&(theFile->m_lock));
+			break;
+		}
+		//Send new slice
+		else if(rtpLength == -1)
+		{
+			pthread_mutex_unlock(&(theFile->m_lock));
+			continue;
+		}
+		theFile->m_RtpPacket.packetTransmitTime = currentTime;
+		//Send it
+		UInt32 err = QTSS_Write(currentStream, &(theFile->m_RtpPacket), rtpLength, NULL, qtssWriteFlagsIsRTP);
+		pthread_mutex_unlock(&(theFile->m_lock));
+		//FIXME Acutally I am not quite sure how to set a proper sleeping time.
+		//usleep() sleeps for #usecond
+		usleep(sleepTime);
+	}
+	printf("We are done sending\n");
+#else
+		TSFileSession *theFile =(TSFileSession *)inArg;
+			QTSS_Object currentStream = (QTSS_Object)(theFile->cookie1);
+			if(currentStream)
+			{
+				bStopSending = false;
+			}
+			SInt32 small = 0;
+			SInt32 large = 0;
+			SInt64 sleepTime = 0;
+			SInt64 timeInterval = 0;
+			SInt32 sizeSent = 0;
+			SInt32 counter = 0;
+			Float32 flowcontrol = 1;
+			//Send packets
+			try{
+				while(bStopSending == false)
+				{
+					//When sending data, I won't be bothered by anyting
+					pthread_mutex_lock(&(theFile->m_lock));
+					SInt64 currentTime = OS::Milliseconds();
+					//Caclulate average sending bit rate
+					if(timeInterval == 0)
+						timeInterval = currentTime;
+					if(currentTime - timeInterval >= 1000)
+					{
+						printf("%2.0fkbit/s\n", (float)8 * sizeSent / (currentTime - timeInterval));
+						sizeSent = 0;
+						timeInterval = 0;
+						counter++;
+						if( counter == 5)
+						{
+							printf("Half sending speed\n");
+							flowcontrol = 2;
+						}
+						else if(counter == 10)
+						{
+							printf("Double sending speed\n");
+							flowcontrol = 0.5;
+						}
+						else if(counter == 13)
+						{
+							printf("Normal sending speed\n");
+							flowcontrol = 1;
+						}
+					}
+					//Read packets and make an rtp packet
+					sleepTime = theFile->m_lSleepTime * flowcontrol;
+					SInt32 rtpLength = theFile->Read7PacketsAndMakeRtp(currentTime);
+					sizeSent += rtpLength;
+					//Maybe file has been sent out
+					if(rtpLength == 0)
+					{
+						pthread_mutex_unlock(&(theFile->m_lock));
+						break;
+					}
+					//Send new slice
+					else if(rtpLength == -1)
+					{
+						pthread_mutex_unlock(&(theFile->m_lock));
+						continue;
+					}
+					theFile->m_RtpPacket.packetTransmitTime = currentTime;
+					//Send it
+					UInt32 err = QTSS_Write(currentStream, &(theFile->m_RtpPacket), rtpLength, NULL, qtssWriteFlagsIsRTP);
+					pthread_mutex_unlock(&(theFile->m_lock));
+					//FIXME Acutally I am not quite sure how to set a proper sleeping time.
+					//usleep() sleeps for #usecond
+					usleep(sleepTime);
+				}
+				//delete theFile;
+			}
+			catch(...)
+			{
+				printf("Something wrong is happening\n");
+			}
+			printf("We are done sending\n");
+#endif
+}
+
+QTSS_Error SendPackets(QTSS_RTPSendPackets_Params* inParams)
+{
+	if(bStart == true)
+	{
+		bStart = false;
+		bStopSending = false;
+		TSFileSession** theFile = NULL;
+		UInt32 theLen = 0;
+		QTSS_Error theErr = QTSS_GetValuePtr(inParams->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
+		theCurrentTSFileSession = *theFile;
+		if(theErr != QTSS_NoErr)
+		{
+			return theErr;
+		}
+		pthread_t tid;
+		pthread_create(&tid, NULL, SendPacketThread, (void*)(*theFile));
+	}
+	//Sleep time
+	inParams->outNextPacketTime = 500;
+	return QTSS_NoErr;
 }
 
 Bool16 GetPCR(unsigned char *p_ts_packet, SInt64 *p_pcr, SInt32 *p_pcr_pid)
@@ -1676,122 +1948,846 @@ Bool16 GetPCR(unsigned char *p_ts_packet, SInt64 *p_pcr, SInt32 *p_pcr_pid)
 	}
 	return false;
 }
-
-
-Bool16 	TSFileSession::GetTwoPcr()
+void 	TSFileSession::GetNextPcr(int inPacketStartOffset)
 {
+#if 1
 	SInt64	lPcr = 0;
 	SInt32	nPid = 0;
 	SInt32	nReadSize;
-	SInt32	nSeq = 0;
+	SInt32	nSeq = inPacketStartOffset;
 	unsigned char pBufferForTsPacket[188];
 	do
 	{
-		nReadSize = fread(pBufferForTsPacket, 1, 188, pFile);
+		nReadSize = fread(pBufferForTsPacket, 1, 188, m_pCurrentFile);
+		if(nReadSize == 0)
+			return;
+		if(GetPCR(pBufferForTsPacket, &lPcr, &nPid) == true)
+		{
+			UpdatePcr(lPcr, nSeq);
+			break;
+		}
+		nSeq++;
+	}while(1);
+	//Reset file pointer
+	fseek(m_pCurrentFile, inPacketStartOffset * 188, SEEK_SET);
+#endif
+}
+//FILE *fileBitrate = fopen("filebitrate", "w");
+Bool16 	TSFileSession::GetTwoPcr(int inPacketOffset)
+{
+#if 0
+	//m_nBitRate = m_FileArray[m_nCurrentSliceType].bitrate;
+	//m_lSleepTime = 188 * 7 * 8 * 1000 * 1000/ m_nBitRate;
+	return true;
+#else
+
+
+	SInt64	lPcr = 0;
+	SInt32	nPid = 0;
+	SInt32	nReadSize;
+	SInt32	nSeq = inPacketOffset;
+	m_lFirstPcr = 0;
+	m_lSecondPcr = 0;
+	unsigned char pBufferForTsPacket[188];
+	//FILE *pfile = fopen("/usr/local/movies/test2.ts", "rb");
+	//nReadSize = fread(pBufferForTsPacket, 1, 188, pfile);
+	do
+	{
+		nReadSize = fread(pBufferForTsPacket, 1, 188, m_pCurrentFile);
+		if(nReadSize == 0)
+			return false;
 		Assert(nReadSize == 188);
 		if(GetPCR(pBufferForTsPacket, &lPcr, &nPid) == true)
 		{
-			if(lFirstPcr == 0)
+			if(m_lFirstPcr == 0)
 			{
-				lFirstPcr = lPcr;
-				nFirstPcrSeq = nSeq;
+				m_lLastTimeWeGetPcr = OS::Milliseconds();
+				m_lFirstPcr = lPcr;
+				m_nFirstPcrSeq = nSeq;
 			}
-			else if(lSecondPcr == 0)
+			else if(m_lSecondPcr == 0)
 			{
-				lSecondPcr = lPcr;
-				nSecondPcrSeq = nSeq;
+				m_lLastTimeWeGetPcr = OS::Milliseconds();
+				m_lSecondPcr = lPcr;
+				m_nSecondPcrSeq = nSeq;
 			}
+			//Coz we get both first and second pcr, if we find they both are zero, that means
+			//we are done searching
 			else
 			{
 				break;
 			}
 		}
 		nSeq++;
-	}while(nReadSize);
-	//printf("firstpcr %lld seq %d\nsecondpcr %lld seq %d\n", lFirstPcr, nFirstPcrSeq, lSecondPcr, nSecondPcrSeq);
+	}while(1);
 	//Reset file pointer
-	int ret =fseek(pFile, 0L, 0);
-	//Compute bit rate and sleep time
-	fBitRate = (Float64)(nSecondPcrSeq - nFirstPcrSeq)*188*8*27000000/(lSecondPcr - lFirstPcr);
-	fWaitTime = (Float32)1000 * 188 * 8 * 7 / fBitRate;
-	//printf("bit rate %lf wait time %lf\n", fBitRate, fWaitTime);
-	if(lFirstPcr && lSecondPcr)
+	int ret =fseek(m_pCurrentFile, inPacketOffset * 188, SEEK_SET);
+	//Caculate bit rate and sleep time
+	m_nBitRate = (Float64)(m_nSecondPcrSeq - m_nFirstPcrSeq)*188*8*27000000/(m_lSecondPcr - m_lFirstPcr);
+	//fprintf(fileBitrate, "%d\t%d\t%d\n", m_nBitRate, m_nFirstPcrSeq, m_nSecondPcrSeq);
+	m_lSleepTime = (Float32)(m_lSecondPcr - m_lFirstPcr) * 7 / ((m_nSecondPcrSeq - m_nFirstPcrSeq) * 27);
+	if(m_lFirstPcr && m_lSecondPcr)
 	{
 		return true;
 	}
 	return false;
+#endif
 }
 
 void TSFileSession::UpdatePcr(UInt64 lNewPcr, UInt32 nSeq)
 {
-//	static SInt32 trigger = 0;
-//	if(trigger++ == 20)
-//	{
-//		trigger = 0;
-//		printf("newpcr %lld seq %d\n", lNewPcr, nSeq);
-//	}
-	lFirstPcr = lSecondPcr;
-	nFirstPcrSeq = nSecondPcrSeq;
-	lSecondPcr = lNewPcr;
-	nSecondPcrSeq = nSeq;
-	//Compute the average bit rate
-	fBitRate = (Float64)(nSecondPcrSeq - nFirstPcrSeq)*188*8*27000000/(lSecondPcr - lFirstPcr);
-	fWaitTime = (Float32)1000 * 188 * 8 * 7 / fBitRate;
-	//printf("bit rate %lf wait time %lf\n", fBitRate, fWaitTime);
+#if 0
+	return ;
+	m_nBitRate = m_FileArray[m_nCurrentSliceType].bitrate;
+	m_lSleepTime = (SInt64)188 * 7 * 8 * 1000 * 1000 / m_nBitRate;
+#else
+	if(nSeq == m_nFirstPcrSeq || nSeq == m_nSecondPcrSeq)
+		return;
+	m_lFirstPcr = m_lSecondPcr;
+	m_nFirstPcrSeq = m_nSecondPcrSeq;
+	m_lSecondPcr = lNewPcr;
+	m_nSecondPcrSeq = nSeq;
+	m_lLastTimeWeGetPcr = OS::Milliseconds();
+	//Calculate the average bit rate
+	m_nBitRate = (Float64)(m_nSecondPcrSeq - m_nFirstPcrSeq)*188*8*27000000/(m_lSecondPcr - m_lFirstPcr);
+	//fprintf(fileBitrate, "%d\t%d\t%d\n", m_nBitRate, m_nFirstPcrSeq, m_nSecondPcrSeq);
+	//New method to calculate sleep time(every 7 ts packets)
+	m_lSleepTime = (Float32)(m_lSecondPcr - m_lFirstPcr) * 7 / ((m_nSecondPcrSeq - m_nFirstPcrSeq) * 27);
+#endif
 }
-
 UInt32	TSFileSession::Read7PacketsAndMakeRtp(SInt64 inTimeStamp)
 {
+#if 0
+	SInt32 	readSize = 0;
+	UInt32 	rtpPayloadSize = 0;
+	//First # bytes are reserved for rtp header
+	unsigned char *pBufferFor7Packets = m_RtpBuffer + 12 + m_nRtpXHeaderLength;
+	for(int i = 0; i < 7; i++)
+	{
+		readSize = fread(pBufferFor7Packets + rtpPayloadSize, 1, 188, m_pCurrentFile);
+		if(readSize == 0)
+			break;
+		Assert(readSize == 188);
+		//Assure that when switching slice is triggered, we should send out our complete frame in last slice
+		//We can see if payload_unit_start == 1 or not
+		//If yes, we switch it to new slice
+		if(m_bSliceHasChanged == true && ((pBufferFor7Packets + rtpPayloadSize)[1] >> 6 & 0x01 == 1))
+		{
+			m_bSliceHasChanged = false;
+			m_nCurrentTsPacketOffset = m_nNewCurrentTsPacketOffset;
+			m_pCurrentFile = m_nNewCurrentFile;
+			m_nCurrentSliceType = m_nNewCurrentSliceType;
+			m_nBitRate = m_FileArray[m_nCurrentSliceType].bitrate;
+			m_lSleepTime = (SInt64)188 * 7 * 8 * 1000 * 1000 / m_nBitRate;
+			//Return size so as to inform caller skip this sending
+			if(rtpPayloadSize == 0)
+				return -1;
+			else
+				return CreateRtp(rtpPayloadSize, 33, inTimeStamp, true);
+		}
+		//If not, we still send current slice
+
+		//Record our reading track
+		rtpPayloadSize += readSize;
+		m_nCurrentTsPacketOffset++;
+	}
+	//Create rtp and return rtp length
+	return CreateRtp(rtpPayloadSize, 33, inTimeStamp, true);
+#else
 	SInt32 	readSize = 0;
 	SInt64	lPcr = 0;
 	SInt32	nPcrPid = 0;
-	lSizeOfBuffer = 0;
+	UInt32 	rtpPayloadSize = 0;
+	//First # bytes are reserved for rtp header
+	unsigned char *pBufferFor7Packets = m_RtpBuffer + 12 + m_nRtpXHeaderLength;
 	for(int i = 0; i < 7; i++)
 	{
-		readSize = fread(pBufferFor7Packets + lSizeOfBuffer, 1, 188, pFile);
-		if(readSize != 188)
-		{
+		readSize = fread(pBufferFor7Packets + rtpPayloadSize, 1, 188, m_pCurrentFile);
+		if(readSize == 0)
 			break;
-		}
-		//Check whether we have a pcr
-		if(GetPCR(pBufferFor7Packets + lSizeOfBuffer, &lPcr, &nPcrPid))
+		//Assure that when switching slice is triggered, we should send out our complete frame in last slice
+		//We can see if payload_unit_start == 1 or not
+		//If yes, we switch it to new slice
+		if(m_bSliceHasChanged == true && ((pBufferFor7Packets + rtpPayloadSize)[1] >> 6 & 0x01 == 1))
 		{
-			UpdatePcr(lPcr, nCurrentTsPacketSeq);
+			//Debug
+			//printf("slice type %d\tts packet %d\tpackets read %d\tbytes %2x %2x %2x %2x\n", m_nCurrentSliceType, m_nCurrentTsPacketOffset, i, pBufferFor7Packets[5], pBufferFor7Packets[6], pBufferFor7Packets[7], pBufferFor7Packets[8]);
+			m_bSliceHasChanged = false;
+			m_nCurrentTsPacketOffset = m_nNewCurrentTsPacketOffset;
+			m_pCurrentFile = m_nNewCurrentFile;
+			m_nCurrentSliceType = m_nNewCurrentSliceType;
+			//Get new bitrate and sleep-time
+			if(GetTwoPcr(m_nCurrentTsPacketOffset) == false)
+			{
+				bStopSending = true;
+				return -2;
+			}
+			//Return size so as to inform caller skip this sending
+			if(rtpPayloadSize == 0)
+				return -1;
+			else
+				return CreateRtp(rtpPayloadSize, 33, inTimeStamp, true);
+		}
+		//If not, we still send current slice
+
+		//Check whether we have a pcr
+		if(GetPCR(pBufferFor7Packets + rtpPayloadSize, &lPcr, &nPcrPid))
+		{
+			UpdatePcr(lPcr, m_nCurrentTsPacketOffset);
 		}
 		//Record our reading track
-		lSizeOfBuffer += readSize;
-		nCurrentTsPacketSeq++;
+		rtpPayloadSize += readSize;
+		m_nCurrentTsPacketOffset++;
 	}
-	//Create rtp
-	oRtpPacket.CreateRtp(pBufferFor7Packets, lSizeOfBuffer, 33, inTimeStamp, globalTrackSSRC, &nCurrentRtpPacketSeq, true);
-	//Return rtp packet length
-	return oRtpPacket.m_nRtpLength;
+	if(m_nCurrentTsPacketOffset >= m_nSecondPcrSeq)
+	{
+		GetNextPcr(m_nCurrentTsPacketOffset);
+	}
+	//Create rtp and return rtp length
+	return CreateRtp(rtpPayloadSize, 33, inTimeStamp, true);
+#endif
+
 }
 
-void Ts2Rtp::CreateRtp(unsigned char *inData, SInt32 inLength, SInt32 inPayloadType, SInt64 inTimeStamp, UInt32 inSSRC, SInt32 *ioSeqNum, Bool16 inMarker)
+UInt32 TSFileSession::CreateRtp(SInt32 inLength, SInt32 inPayloadType, SInt64 inTimeStamp, Bool16 inMarker)
 {
-	Assert(inData != NULL && inLength > 0);
+	Assert(inLength > 0);
+	if(inLength == 0)
+		return 0;
+	//Extend rtp
+	m_RtpBuffer[0] = 0x90;
+	m_RtpBuffer[1] = (inMarker ? 0x80 : 0x00) | inPayloadType;
 
-	m_pBuffer[0] = 0x80;
-	m_pBuffer[1] = (inMarker ? 0x80 : 0x00) | inPayloadType;
+	m_RtpBuffer[2] = ((m_nCurrentRtpPacketSeq) >> 8) & 0xff;
+	m_RtpBuffer[3] = (m_nCurrentRtpPacketSeq) & 0xff;
 
-	m_pBuffer[2] = ((*ioSeqNum) >> 8) & 0xff;
-	m_pBuffer[3] = (*ioSeqNum) & 0xff;
+	//int a = int((m_RtpBuffer[2]) << 8 | (m_RtpBuffer[3]));
 
-	m_pBuffer[4] = (unsigned char)(inTimeStamp >> 24) & 0xff;
-	m_pBuffer[5] = (unsigned char)(inTimeStamp >> 16) & 0xff;
-	m_pBuffer[6] = (unsigned char)(inTimeStamp >>  8) & 0xff;
-	m_pBuffer[7] = (unsigned char)inTimeStamp & 0xff;
+	m_RtpBuffer[4] = (unsigned char)(inTimeStamp >> 24) & 0xff;
+	m_RtpBuffer[5] = (unsigned char)(inTimeStamp >> 16) & 0xff;
+	m_RtpBuffer[6] = (unsigned char)(inTimeStamp >>  8) & 0xff;
+	m_RtpBuffer[7] = (unsigned char)inTimeStamp & 0xff;
 
-	m_pBuffer[ 8] = (inSSRC >> 24) & 0xff;
-	m_pBuffer[ 9] = (inSSRC >> 16) & 0xff;
-	m_pBuffer[10] = (inSSRC >>  8) & 0xff;
-	m_pBuffer[11] = inSSRC & 0xff;
+	//int *t = ((int*)(m_RtpBuffer + 4));
 
-	(*ioSeqNum)++;
+	m_RtpBuffer[ 8] = (*m_pSSRC >> 24) & 0xff;
+	m_RtpBuffer[ 9] = (*m_pSSRC >> 16) & 0xff;
+	m_RtpBuffer[10] = (*m_pSSRC >>  8) & 0xff;
+	m_RtpBuffer[11] = *m_pSSRC & 0xff;
 
-	memcpy(m_pBuffer + 12, inData, inLength);
-	m_nRtpLength =  inLength + 12;
-	m_oPacket.packetData = m_pBuffer;
+	m_RtpBuffer[12] = 0x00;
+	m_RtpBuffer[13] = 0x00;
+
+	//Extended rtp header length
+	m_RtpBuffer[14] = 0x00;
+	m_RtpBuffer[15] = 2;
+
+	//m_RtpBuffer[16 17 18 19]contains current average bit rate
+	//# kbps
+	SInt32 nBitrate = m_FileArray[m_nCurrentSliceType].bitrate;
+	m_RtpBuffer[19] = (nBitrate >> 24) & 0xFF;
+	m_RtpBuffer[18] = (nBitrate >> 16) & 0xFF;
+	m_RtpBuffer[17] = (nBitrate >>  8) & 0XFF;
+	m_RtpBuffer[16] = nBitrate & 0xFF;
+
+	SInt32 nSendRate = m_nSendRate;
+	m_RtpBuffer[23] = (nSendRate >> 24) & 0xFF;
+	m_RtpBuffer[22] = (nSendRate >> 16) & 0xFF;
+	m_RtpBuffer[21] = (nSendRate >>  8) & 0XFF;
+	m_RtpBuffer[20] = nSendRate & 0xFF;
+
+	m_nCurrentRtpPacketSeq++;
+
+	m_RtpPacket.packetData = m_RtpBuffer;
+	return inLength + 12 + m_nRtpXHeaderLength;
 }
+
+QTSS_Error ProcessRTCP(QTSS_RTCPProcess_Params* inParamBlock)
+{
+	//return QTSS_NoErr;
+	UInt32* uint32Ptr = NULL;
+	UInt32 theLen = 0;
+	(void)QTSS_GetValuePtr(inParamBlock->inRTPStream, qtssRTPStrJitter, 0, (void**)&uint32Ptr, &theLen);
+
+	TSFileSession** theFile = NULL;
+	QTSS_Error theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
+
+
+	UInt32 jitter = (*uint32Ptr) & 0xFFFF;
+	UInt32 buffer = (((*uint32Ptr) >> 16) & 0X3FF) / 10.0;
+
+	UInt32 loss = ((*uint32Ptr) >> 26) & 0X3;
+	UInt32 id = ((*uint32Ptr) >> 31) & 0X1;
+	static int fc_Outband = 0;
+	static int fc_JitterGreater = 0;
+	if(id == 1)
+	{
+		(*theFile)->FlowControl(jitter, buffer, loss);
+	}
+	(*theFile)->m_nLastBuffer = buffer;
+	(*theFile)->m_fLastRateFactor = (*theFile)->m_fRateFactor;
+#if 0
+	(*theFile)->m_FeedBack.switchSlice = ((*uint32Ptr) >> 30) & 0x01;
+	(*theFile)->m_FeedBack.newSlice = ((*uint32Ptr) >> 24) & 0x0F;
+	(*theFile)->m_FeedBack.expectedRate = (*uint32Ptr) & 0x00FFFFFF;
+	if((*theFile)->m_FeedBack.expectedRate > 0)
+	{
+		(*theFile)->m_FeedBack.clientassign = 1;
+		(*theFile)->m_nBitRate = (*theFile)->m_FeedBack.expectedRate;
+		(*theFile)->m_lSleepTime = (SInt64)188 * 7 * 8 * 1000 * 1000 / (*theFile)->m_nBitRate;
+	}
+	else
+	{
+		(*theFile)->m_FeedBack.clientassign = 0;
+	}
+	printf("Switch %d New slice %d Expected rate %2.0fkbps\n", (*theFile)->m_FeedBack.switchSlice, (*theFile)->m_FeedBack.newSlice, (Float64)(*theFile)->m_FeedBack.expectedRate / 1000);
+	if((*theFile)->m_FeedBack.switchSlice == 1)
+	{
+		(*theFile)->ChangeSlice((TSFileSession::SLICETYPE)(*theFile)->m_FeedBack.newSlice);
+	}
+#endif
+
+	return QTSS_NoErr;
+#if 0
+	static int counter = 0;
+	counter++;
+	if(counter == 4)
+	{
+		printf("Switch slice to LOW\n");
+		TSFileSession** theFile = NULL;
+		UInt32 theLen = 0;
+		QTSS_Error theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
+		(*theFile)->ChangeSlice((*theFile)->LOW);
+	}
+	else if(counter == 6)
+	{
+		printf("Switch slice HIGH\n");
+		TSFileSession** theFile = NULL;
+		UInt32 theLen = 0;
+		QTSS_Error theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
+		(*theFile)->ChangeSlice((*theFile)->HIGH);
+	}
+	else if(counter == 8)
+	{
+		printf("Switch slice MEDIUM\n");
+		TSFileSession** theFile = NULL;
+		UInt32 theLen = 0;
+		QTSS_Error theErr = QTSS_GetValuePtr(inParamBlock->inClientSession, sFileSessionAttr, 0, (void**)&theFile, &theLen);
+		(*theFile)->ChangeSlice((*theFile)->MEDIUM);
+	}
+	//printf("Jitter %d\n", jitter);
+	return QTSS_NoErr;
+#endif
+}
+UInt32	TSFileSession::ChangeSlice(SLICETYPE inType)
+{
+	if(inType == m_nCurrentSliceType)
+		return -1;
+	printf("\nChanging slice...\n");
+	//To avoid sending thread running at moment, we should lock it
+	pthread_mutex_lock(&m_lock);
+	if(m_nCurrentSliceType > inType)
+		m_fLastRateFactor = m_fRateFactor = 1.2;
+	else
+		m_fLastRateFactor = m_fRateFactor = 0.5;
+
+	m_bSliceHasChanged = true;
+	/*m_pCurrentFile*/m_nNewCurrentFile = m_FileArray[inType].file;
+	//Get next slice that we wanna send
+	int nextSlice = GetCurrentSliceIndex() + 1;
+	//printf("nextSlice %d\n", nextSlice);
+	//Attention We have to replace slice type with new type after above statement
+	/*m_nCurrentSliceType*/m_nNewCurrentSliceType = inType;
+	int	nextIFramePosition = GetIFramePosition(m_nNewCurrentSliceType, nextSlice);
+	//printf("nextIFrame %d\n", nextIFramePosition);
+	if(nextIFramePosition == -1)
+	{
+		bStopSending = true;
+		return -1;
+	}
+	fseek(m_nNewCurrentFile, nextIFramePosition * 188, SEEK_SET);
+	/*m_nCurrentTsPacketOffset*/m_nNewCurrentTsPacketOffset = nextIFramePosition;
+	pthread_mutex_unlock(&m_lock);
+	return 0;
+}
+//Return current slice index using current ts packet offset
+SInt32	TSFileSession::GetCurrentSliceIndex()
+{
+	for(int i = 1;  m_SliceOffset[m_nCurrentSliceType][i] != -1; i++)
+	{
+		if(m_nCurrentTsPacketOffset > m_SliceOffset[m_nCurrentSliceType][i])
+			continue;
+		return i - 1;
+	}
+	return -1;
+}
+
+SInt32	TSFileSession::GetIFramePosition(SLICETYPE inType, SInt32 inSliceIndex)
+{
+	int sliceOffset = m_SliceOffset[inType][inSliceIndex];
+	for(int i = 0; m_IFrameOffset[inType][i] != -1; i++)
+	{
+		if(sliceOffset > m_IFrameOffset[inType][i])
+			continue;
+		return m_IFrameOffset[inType][i];
+	}
+	return -1;
+}
+Float32	AdjustRateFactorByJitter(UInt32 inJitter)
+{
+	switch(inJitter)
+	{
+	case 0:
+		return 1;
+	case 1:
+		return 0.9;
+	case 2:
+		return 0.85;
+	case 3:
+		return 0.8;
+	default:
+		return 1;
+		break;
+	}
+}
+Float32 TSFileSession::GetAvgSendRate()
+{
+	float Sum = 0;
+	int i = 0;
+	for(; i < 4; i++)
+	{
+		if(m_nSendRateLast4Times[i] == -1)
+			break;
+		Sum += m_nSendRateLast4Times[i];
+	}
+	if(i == 0)
+		return m_FileArray[m_nCurrentSliceType].bitrate / 1000;
+	else
+		return Sum / i;
+}
+static float lastRateWhenProbing = 0;
+void 	TSFileSession::FlowControl(UInt32 inJitter, UInt32 inBuffer, UInt32 inLoss)
+{
+	printf("---------------RTCP j(%d) b(%d) l(%d)---------------\n", inJitter, inBuffer, inLoss);
+	//@1 Low buffer utility
+	//@2 High buffer utility
+	//@3 Normal buffer utility
+	//@4 High or many jitter
+	//@5 Normal jitter
+	static int nextProbeSendRate = 0;
+	static int sliceChangeOkAndDownToNormal = 0;
+	if(CheckAndDoChangeSlice(inJitter) == false)
+	{
+		ProbeHigherSendingRate(inJitter, inBuffer);
+	}
+	else
+	{
+		//Clear
+		lastRateWhenProbing = 0;
+	}
+	printf("\n");
+#if 0
+	printf("---------------RTCP j(%d) b(%d) l(%d)---------------\n", inJitter, inBuffer, inLoss);
+	//@1 Low buffer utility
+	//@2 High buffer utility
+	//@3 Normal buffer utility
+	//@4 High or many jitter
+	//@5 Normal jitter
+	static int nextProbeSendRate = 0;
+	static int sliceChangeOkAndDownToNormal = 0;
+	m_fLastRateFactor = m_fRateFactor;
+	if(inBuffer <= 20)
+	{
+		printf("buffer < 20  ");
+		if(inJitter == 0 && m_nCurrentSliceType != HIGH)
+		{
+			m_fRateFactor = 3.0;
+			printf("jitter = 0 rf %f  ", m_fRateFactor);
+		}
+		else if(m_nCurrentSliceType == HIGH)
+		{
+			m_fRateFactor = 1.8;
+		}
+		else
+		{
+			CheckAndDoChangeSlice(GetAvgSendRate(), inJitter);
+		}
+		printf("jitter == %d rf %f  ", inJitter, m_fRateFactor);
+	}
+	else if(inBuffer <= 60)
+	{
+		printf("buffer <= 60  ");
+		if(sliceChangeOkAndDownToNormal > 0)
+		{
+			if(inBuffer < 50)
+				m_fRateFactor = 1.0;
+			sliceChangeOkAndDownToNormal--;
+			printf("  sliceChangeOkAndDownToNormal %d \n", sliceChangeOkAndDownToNormal);
+			return;
+		}
+
+		//If network is good
+		if(inJitter == 0 && m_nCurrentSliceType != HIGH)
+		{
+			nextProbeSendRate++;
+		}
+		//After a continous time, maybe we need to probe a higher sending rate again
+		//If we did not encounter bad network in # seconds, then we probe a higher rate
+		if(m_nLastBuffer >= 80)
+		{
+			nextProbeSendRate = 0;
+		}
+		else if(inBuffer <= 45 && nextProbeSendRate >= 3)
+		{
+			printf("  ***** trying to probe higher rate ");
+			m_fRateFactor = 3.0;
+			//nextProbeSendRate = 0;
+		}
+		else
+		{
+			m_fRateFactor = 1.0;
+		}
+		if(CheckAndDoChangeSlice(GetAvgSendRate(), inJitter) == true)
+		{
+			nextProbeSendRate = 0;
+			m_fRateFactor = 0.1;
+			sliceChangeOkAndDownToNormal = 2;
+		}
+		printf("jitter = %d rf %f  ", inJitter, m_fRateFactor);
+	}
+	else if(inBuffer <= 80)
+	{
+		printf("buffer < 80  ");
+		if(sliceChangeOkAndDownToNormal > 0)
+		{
+			sliceChangeOkAndDownToNormal--;
+			printf("  sliceChangeOkAndDownToNormal %d \n", sliceChangeOkAndDownToNormal);
+			return;
+		}
+		//If we know this time we just wanna probe a higher rate
+		if(nextProbeSendRate >= 3)
+		{
+
+		}
+		else
+		{
+			if(inBuffer < 65)
+				m_fRateFactor = 1.0;
+			else
+				m_fRateFactor = 0.3;
+		}
+		if(CheckAndDoChangeSlice(GetAvgSendRate(), inJitter) == true || inJitter > 2)
+		{
+			m_fRateFactor = 0.1;
+			if(inJitter == 0)
+				sliceChangeOkAndDownToNormal = 2;
+			nextProbeSendRate = 0;
+		}
+		printf("jitter = %drf %f  ", inJitter, m_fRateFactor);
+
+	}
+	else
+	{
+		printf("buffer > 80  ");
+		//We will stop probing here
+		nextProbeSendRate = 0;
+		CheckAndDoChangeSlice(GetAvgSendRate(), inJitter);
+		m_fRateFactor = 0.1;
+		printf("jitter = %drf %f  ", inJitter, m_fRateFactor);
+	}
+	printf("\n");
+#endif
+}
+bool 	TSFileSession::CheckAndDoChangeSlice(UInt32 inJitter)
+{
+	//@1 Low  	-> 	Medium
+	//@2 Medium -> 	High
+	//@3 High 	->	Medium
+	//@4 Medium	->	Low
+	static int HighDfCounter = 0;
+	static int LastHighDf = 0;
+	int CurrentSendRate = GetAvgSendRate() / 1000;
+	printf("Current send rate %d kbps ", CurrentSendRate);
+	int ret = -1;
+	//Switch up
+	if(inJitter <= 60)
+	{
+		switch(m_nCurrentSliceType)
+		{
+		case LOW:
+			if(CurrentSendRate >= m_FileArray[MEDIUM].bitrate / 1000)
+			{
+				ret = ChangeSlice(MEDIUM);
+				printf("  #Change slice# LOW->MEDIUM  ");
+			}
+			break;
+		case MEDIUM:
+			if(CurrentSendRate >= m_FileArray[HIGH].bitrate / 1000)
+			{
+				ret = ChangeSlice(HIGH);
+				printf("  #Change slice# MEDIUM->HIGH  ");
+			}
+			break;
+		}
+	}
+	//Switch down
+	else if(inJitter >= 300)
+	{
+		//If last time jitter is smaller than this one
+		if(LastHighDf < inJitter)
+		{
+			printf("Jitter is higher!\n");
+			switch(m_nCurrentSliceType)
+			{
+			case HIGH:
+				ret = ChangeSlice(MEDIUM);
+				printf("  #Change slice# HIGH->MEDIUM  ");
+				break;
+			case MEDIUM:
+				ret = ChangeSlice(LOW);
+				printf("  #Change slice# MEDIUM->LOW  ");
+				break;
+			}
+		}
+	}
+	LastHighDf = inJitter;
+	return ret != -1;
+
+
+#if 0
+	int CurrentSendRate = GetAvgSendRate() / 1000;
+	printf("Current send rate %d kbps ", CurrentSendRate);
+	int ret = -1;
+	switch(m_nCurrentSliceType)
+	{
+	case LOW:
+		if(CurrentSendRate >= m_FileArray[MEDIUM].bitrate / 1000 * 0.8 && inJitter == 0)
+		{
+			ret = ChangeSlice(MEDIUM);
+			printf("  #Change slice# LOW->MEDIUM  ");
+			return ret == 0;
+		}
+		break;
+	case MEDIUM:
+		if(CurrentSendRate >= m_FileArray[HIGH].bitrate / 1000 * 0.8 && inJitter == 0)
+		{
+			ret = ChangeSlice(HIGH);
+			printf("  #Change slice# MEDIUM->HIGH  ");
+			return ret == 0;
+		}
+		else if(CurrentSendRate <= m_FileArray[LOW].bitrate / 1000 * 1.5 && inJitter >= 2)
+		{
+			ret = ChangeSlice(LOW);
+			printf("  #Change slice# MEDIUM->LOW  ");
+			return ret == 0;
+		}
+		break;
+
+	case HIGH:
+		if(CurrentSendRate <= m_FileArray[LOW].bitrate / 1000 * 1.5 && inJitter >= 2)
+		{
+			ret = ChangeSlice(LOW);
+			printf("  #Change slice# HIGH->LOW  ");
+			return ret == 0;
+		}
+		else if(CurrentSendRate <= m_FileArray[MEDIUM].bitrate / 1000 * 1.5  && inJitter >= 2)
+		{
+			ret = ChangeSlice(MEDIUM);
+			printf("  #Change slice# HIGH->MEDIUM  ");
+			return ret == 0;
+		}
+		break;
+	}
+	return false;
+	printf("  No Change Slice  ");
+#endif
+}
+
+void	TSFileSession::ProbeHigherSendingRate(UInt32 inJitter, UInt32 inBuffer)
+{
+	static int lastHighJitter = 0;
+	static bool stillTryProbing = false;
+	static bool	DropDownBufferToSpeedUp = false;
+	static enum{UNDERFLOW = 0, SPEEDUP, STAINABLE, OVERFLOW}lastArea = UNDERFLOW;
+	static bool firstTimeToPull = true;
+	static bool tryPullUpBuffer = false;
+	static bool tryFindHigherRate = false;
+	stillTryProbing = (m_nCurrentSliceType != HIGH);
+	static int lastTimeSliceType = 0;
+	if(lastTimeSliceType == 0)
+		lastTimeSliceType = m_nCurrentSliceType;
+	if(lastTimeSliceType == m_nCurrentSliceType)
+	{
+		tryFindHigherRate = true;
+	}
+	else
+	{
+		tryFindHigherRate = false;
+	}
+	if(inJitter >= 100)
+	{
+		m_fRateFactor *= 0.8;
+		printf("Jitter too larege\n");
+	}
+	else
+	{
+		if(inBuffer <= 10)
+		{
+			if(firstTimeToPull == true)
+			{
+				firstTimeToPull = false;
+				tryFindHigherRate = true;
+			}
+			else
+			{
+				tryPullUpBuffer = true;
+				m_fRateFactor = 1.5;
+			}
+			lastArea = UNDERFLOW;
+		}
+		else if(inBuffer > 10 && inBuffer <= 40)
+		{
+			if(tryFindHigherRate == true)
+			{
+				tryPullUpBuffer = false;
+				m_fRateFactor *= 1.5;
+			}
+			else if(tryPullUpBuffer == true)
+			{
+				tryFindHigherRate = false;
+				m_fRateFactor *= 1.1;
+			}
+			else
+			{
+				m_fRateFactor = 1.1;
+			}
+			lastArea = SPEEDUP;
+		}
+		else if(inBuffer > 40 && inBuffer <= 80)
+		{
+			if(tryPullUpBuffer == true)
+			{
+				tryPullUpBuffer = false;
+				m_fRateFactor = 1.0;
+			}
+			else if(tryFindHigherRate == true && lastArea != STAINABLE)
+			{
+				if(GetAvgSendRate() / 1000 > 1000)
+				{
+					m_fRateFactor *= 0.8;
+				}
+			}
+			else
+			{
+				if(stillTryProbing == true)
+				{
+					tryFindHigherRate = true;
+					tryPullUpBuffer = false;
+					m_fRateFactor = 0.6;
+				}
+				else
+				{
+					if(inBuffer < 60)
+						m_fRateFactor = 1.0;
+					else
+						m_fRateFactor = 0.7;
+					if(GetAvgSendRate() / 1000 > 1000)
+					{
+						m_fRateFactor *= 0.8;
+					}
+				}
+			}
+			//Does other case exist?
+			lastArea = STAINABLE;
+		}
+		else
+		{
+			tryFindHigherRate = false;
+			m_fRateFactor = 0.1;
+			lastArea = OVERFLOW;
+		}
+	}
+	lastHighJitter = inJitter;
+	printf("\nRR %2.2f  ", m_fRateFactor);
+#if 0
+	//If we try to probe #times, and still encounter big jitter when speed up, then
+	//we have to keep current speed
+	static int networkLimitTimes = 0;
+	static int weEncounterNetWorkLimit = 0;
+	//Hey, it tells us network is getting bad
+	if(inJitter >= 100)
+	{
+		//weEncounterNetWorkLimit = 1;
+		networkLimitTimes++;
+		m_fRateFactor *= 0.8;
+		weEncounterNetWorkLimit = 1;
+		printf(" Bad network %d |", networkLimitTimes);
+		//printf("RR %2.2f  ", m_fRateFactor);
+		//return;
+	}
+	else
+	{
+		//weEncounterNetWorkLimit = 0;
+		//See if we encounter bad network before
+		if(networkLimitTimes != 0)
+			weEncounterNetWorkLimit = 1;
+		else
+			weEncounterNetWorkLimit = 0;
+		printf(" Good network %d weEncounterNetWorkLimit %d |", networkLimitTimes, weEncounterNetWorkLimit);
+	}
+
+	//With good network and adequete remaining buffer, why not speed up, man?
+	if(inBuffer < 50 && inJitter < 60)
+	{
+		//Still try to probe if network is good(and before)
+		if(networkLimitTimes == 0 && weEncounterNetWorkLimit == 0)
+		{
+			printf(" Still try to probe coz' good network and no limit before |");
+			if(m_fRateFactor < 1.0)
+				m_fRateFactor = 1.0;
+			else
+				m_fRateFactor *= 1.5;
+		}
+		//But if we met bad network, keep here
+		else if(weEncounterNetWorkLimit == 1)
+		{
+			printf(" Coz' we met limit before, we keep rate here|");
+			m_fRateFactor *= 1.0;
+		}
+//		if(inBuffer > 40 && m_nCurrentSliceType == HIGH)
+//			m_fRateFactor *= 1.0;
+	}
+	//Overflow warning
+	if(inBuffer > 90)
+	{
+		m_fRateFactor = 0.1;
+	}
+	//Overflow buffer
+	else if(inBuffer > 80)
+	{
+		m_fRateFactor = 0.2;
+	}
+
+	if(inBuffer >= 50 && inBuffer <= 70)
+	{
+		//Good network, so we keep norminal rate here
+		if(networkLimitTimes == 0 && weEncounterNetWorkLimit == 0)
+		{
+			printf(" Good network and we met no limit before so we keep norminal rate |");
+			m_fRateFactor *= 1.0;
+		}
+		else if(weEncounterNetWorkLimit == 1)
+		{
+			printf(" We met bad network before so keep last rate here |");
+			m_fRateFactor *= 1.0;
+		}
+
+//		if(m_nCurrentSliceType == HIGH)
+//			m_fRateFactor *= 1.0;
+	}
+#endif
+
+}
+
+
 

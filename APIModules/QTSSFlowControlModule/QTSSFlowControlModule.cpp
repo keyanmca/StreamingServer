@@ -268,6 +268,7 @@ QTSS_Error ProcessRTCPPacket(QTSS_RTCPProcess_Params* inParams)
         theNumWorses = *uint32Ptr;
      
     
+
     //First take any action necessitated by the loss percent
     (void)QTSS_GetValuePtr(inParams->inRTPStream, qtssRTPStrPercentPacketsLost, 0, (void**)&uint16Ptr, &theLen);
     if ((uint16Ptr != NULL) && (theLen == sizeof(UInt16)))

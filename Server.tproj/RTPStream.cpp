@@ -1112,6 +1112,12 @@ QTSS_Error  RTPStream::Write(void* inBuffer, UInt32 inLen, UInt32* outLenWritten
     //
     // Data passed into this version of write must be a QTSS_PacketStruct
     QTSS_PacketStruct* thePacket = (QTSS_PacketStruct*)inBuffer;
+
+//    if(inFlags == 0x0010)
+//    {
+//    	(void)fSockets->GetSocketA()->SendTo(fRemoteAddr, fRemoteRTPPort, thePacket->packetData, inLen);
+//    	return QTSS_NoErr;
+//    }
     thePacket->suggestedWakeupTime = -1;
     SInt64 theCurrentPacketDelay = theTime - thePacket->packetTransmitTime;
 	

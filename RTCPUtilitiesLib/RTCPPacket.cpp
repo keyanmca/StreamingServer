@@ -120,13 +120,17 @@ UInt32 RTCPReceiverPacket::GetCumulativeFractionLostPackets()
 UInt32 RTCPReceiverPacket::GetCumulativeJitter()
 {
     float avgJitter = 0;
+    UInt32	lastJitter = 0;
     for (short i = 0; i < this->GetReportCount(); i++)
     {
-        avgJitter += this->GetJitter(i);
-        avgJitter /= (i + 1);
+    	lastJitter = this->GetJitter(i);
+    	//printf("%d\t", lastJitter);
+        //avgJitter += this->GetJitter(i);
+        //avgJitter /= (i + 1);
     }
-    
-    return (UInt32)avgJitter;
+    //printf("------------------------\n");
+    return lastJitter;
+    //return (UInt32)avgJitter;
 }
 
 
